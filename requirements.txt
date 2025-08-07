@@ -1,0 +1,12 @@
+fastapi
+uvicorn[standard]
+aiofiles
+duckdb
+redis
+python-dotenv
+pydantic
+pytest
+httpx
+pydantic-settings
+python-multipart
+fakeredis
