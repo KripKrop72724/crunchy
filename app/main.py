@@ -1,10 +1,23 @@
 import uuid
 from pathlib import Path
+import asyncio
+import csv
 
 import aiofiles
 import duckdb
 import redis
-from fastapi import BackgroundTasks, Depends, FastAPI, File, Header, HTTPException, Request, UploadFile
+import pyarrow.parquet as pq
+from fastapi import (
+    BackgroundTasks,
+    Depends,
+    FastAPI,
+    File,
+    Header,
+    HTTPException,
+    Request,
+    UploadFile,
+    WebSocket,
+)
 from fastapi.responses import JSONResponse
 
 from .config import API_KEY, DB_PATH, REDIS_URL, UPLOAD_DIR
@@ -25,9 +38,8 @@ def verify_api_key(x_api_key: str = Header(None)):
 @app.on_event("startup")
 def startup_event():
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    # Ensure the database file exists
     conn = duckdb.connect(DB_PATH)
-    conn.execute("INSTALL excel;")
-    conn.execute("LOAD excel;")
     conn.close()
 
 
@@ -37,16 +49,53 @@ def startup_event():
 
 def process_file(job_id: str, file_path: str):
     job_key = f"job:{job_id}"
-    redis_client.hset(job_key, mapping={"status": "processing"})
+    redis_client.hset(job_key, mapping={"status": "processing", "rows": 0})
     try:
         table = f"import_{job_id.replace('-', '_')}"
         conn = duckdb.connect(DB_PATH)
-        conn.execute("LOAD excel;")
-        sql = f"""
-        CREATE OR REPLACE TABLE {table} AS
-        SELECT * FROM read_excel_auto('{file_path}');
-        """
-        conn.execute(sql)
+        ext = Path(file_path).suffix.lower()
+        rows = 0
+        chunk_size = 10000
+
+        if ext == ".csv":
+            with open(file_path, newline="") as f:
+                reader = csv.reader(f)
+                header = next(reader)
+                columns = ", ".join([f'"{c}" TEXT' for c in header])
+                conn.execute(f"CREATE TABLE {table} ({columns})")
+                placeholders = ",".join(["?"] * len(header))
+                chunk = []
+                for row in reader:
+                    chunk.append(row)
+                    if len(chunk) >= chunk_size:
+                        conn.executemany(
+                            f"INSERT INTO {table} VALUES ({placeholders})", chunk
+                        )
+                        rows += len(chunk)
+                        redis_client.hset(job_key, "rows", rows)
+                        chunk = []
+                if chunk:
+                    conn.executemany(
+                        f"INSERT INTO {table} VALUES ({placeholders})", chunk
+                    )
+                    rows += len(chunk)
+                    redis_client.hset(job_key, "rows", rows)
+
+        elif ext == ".parquet":
+            parquet_file = pq.ParquetFile(file_path)
+            conn.execute(
+                f"CREATE TABLE {table} AS SELECT * FROM read_parquet('{file_path}') LIMIT 0"
+            )
+            for batch in parquet_file.iter_batches(batch_size=chunk_size):
+                conn.register("batch", batch)
+                conn.execute(f"INSERT INTO {table} SELECT * FROM batch")
+                conn.unregister("batch")
+                rows += batch.num_rows
+                redis_client.hset(job_key, "rows", rows)
+
+        else:
+            raise ValueError("Unsupported file type")
+
         conn.close()
         redis_client.hset(job_key, mapping={"status": "completed", "table": table})
     except Exception as e:  # pragma: no cover - error path
@@ -76,6 +125,7 @@ async def upload(
         "status": "uploading",
         "uploaded": 0,
         "total": total,
+        "rows": 0,
         "table": "",
         "error": "",
     })
@@ -105,10 +155,40 @@ def status(job_id: str, _: None = Depends(verify_api_key)):
         "status": data.get("status"),
         "uploaded": int(data.get("uploaded", 0)),
         "total": int(data.get("total", 0)) or None,
+        "rows": int(data.get("rows", 0)),
         "table": data.get("table") or None,
         "error": data.get("error") or None,
     }
     return JSONResponse(response)
+
+
+@app.websocket("/ws/status/{job_id}")
+async def ws_status(websocket: WebSocket, job_id: str):
+    await websocket.accept()
+    job_key = f"job:{job_id}"
+    prev = None
+    try:
+        while True:
+            data = redis_client.hgetall(job_key)
+            if not data:
+                await websocket.send_json({"error": "unknown job"})
+                break
+            if data != prev:
+                response = {
+                    "status": data.get("status"),
+                    "uploaded": int(data.get("uploaded", 0)),
+                    "total": int(data.get("total", 0)) or None,
+                    "rows": int(data.get("rows", 0)),
+                    "table": data.get("table") or None,
+                    "error": data.get("error") or None,
+                }
+                await websocket.send_json(response)
+                prev = data
+                if data.get("status") in {"completed", "failed"}:
+                    break
+            await asyncio.sleep(1)
+    finally:
+        await websocket.close()
 
 
 @app.get("/health")
