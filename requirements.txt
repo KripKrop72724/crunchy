@@ -10,3 +10,4 @@ httpx
 pydantic-settings
 python-multipart
 fakeredis
+pyarrow
