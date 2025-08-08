@@ -9,8 +9,9 @@ import aiofiles
 import duckdb
 import redis
 from rq import Queue
-from typing import Any, List, Literal, Optional
-from pydantic import BaseModel, conint
+from typing import Any, List, Literal, Optional, Union
+from datetime import date, datetime
+from pydantic import BaseModel, conint, field_validator
 from fastapi import (
     Depends,
     FastAPI,
@@ -112,8 +113,36 @@ def process_file(job_id: str, file_path: str):
 
 class Filter(BaseModel):
     column: str
-    op: Literal["eq", "neq", "lt", "lte", "gt", "gte", "like", "in", "between"]
-    value: Any
+    op: Literal[
+        "eq",
+        "neq",
+        "lt",
+        "lte",
+        "gt",
+        "gte",
+        "like",
+        "in",
+        "between",
+        "in_range",
+        "is_null",
+        "is_not_null",
+    ]
+    value: Any = None
+
+
+class LogicGroup(BaseModel):
+    logic: List[Union[str, "LogicGroup", Filter]]
+
+    @field_validator("logic")
+    def check_logic(cls, v):  # pragma: no cover - validation
+        if not v or not isinstance(v[0], str) or v[0] not in {"AND", "OR"}:
+            raise ValueError("logic must start with 'AND' or 'OR'")
+        if len(v) < 2:
+            raise ValueError("logic must contain at least one condition")
+        return v
+
+
+LogicGroup.model_rebuild()
 
 
 class OrderBy(BaseModel):
@@ -124,10 +153,17 @@ class OrderBy(BaseModel):
 class QueryRequest(BaseModel):
     filters: List[Filter] = []
     logical_operator: Literal["AND", "OR"] = "AND"
+    logic: Optional[LogicGroup] = None
     order_by: Optional[OrderBy] = None
     limit: conint(gt=0) = 100
     offset: conint(ge=0) = 0
     fields: Optional[List[str]] = None
+
+    @field_validator("logic", mode="before")
+    def wrap_logic(cls, v):  # pragma: no cover - validation
+        if isinstance(v, list):
+            return {"logic": v}
+        return v
 
 
 @lru_cache(maxsize=128)
@@ -148,10 +184,6 @@ def _run_query(table_name: str, req: QueryRequest):
 
     rows_info = conn.execute(f"PRAGMA table_info({safe_table})").fetchall()
     columns = [r[1] for r in rows_info]
-    for f in req.filters:
-        if f.column not in columns:
-            conn.close()
-            raise HTTPException(400, f"Invalid column: {f.column}")
     if req.order_by and req.order_by.column not in columns:
         conn.close()
         raise HTTPException(400, f"Invalid column: {req.order_by.column}")
@@ -164,23 +196,50 @@ def _run_query(table_name: str, req: QueryRequest):
     else:
         select_cols = "*"
 
-    clauses = []
-    params: List[Any] = []
-    for flt in req.filters:
+    col_types = {r[1]: r[2] for r in rows_info}
+
+    def parse_value(column: str, value: Any) -> Any:
+        col_type = col_types.get(column, "").upper()
+        if isinstance(value, str) and col_type in {"DATE", "TIMESTAMP"}:
+            try:
+                if col_type == "DATE":
+                    return date.fromisoformat(value)
+                else:
+                    return datetime.fromisoformat(value)
+            except Exception:
+                conn.close()
+                raise HTTPException(400, f"Invalid date: {value}")
+        return value
+
+    def build_filter(flt: Filter):
+        if flt.column not in columns:
+            conn.close()
+            raise HTTPException(400, f"Invalid column: {flt.column}")
         col = quote_ident(flt.column)
         if flt.op == "in":
             if not isinstance(flt.value, list) or not flt.value:
                 conn.close()
                 raise HTTPException(400, "List value required")
-            placeholders = ", ".join("?" for _ in flt.value)
-            clauses.append(f"{col} IN ({placeholders})")
-            params.extend(flt.value)
+            vals = [parse_value(flt.column, v) for v in flt.value]
+            placeholders = ", ".join("?" for _ in vals)
+            return f"{col} IN ({placeholders})", vals
         elif flt.op == "between":
             if not isinstance(flt.value, list) or len(flt.value) != 2:
                 conn.close()
                 raise HTTPException(400, "Two values required")
-            clauses.append(f"{col} BETWEEN ? AND ?")
-            params.extend(flt.value)
+            vals = [parse_value(flt.column, v) for v in flt.value]
+            return f"{col} BETWEEN ? AND ?", vals
+        elif flt.op == "in_range":
+            if not isinstance(flt.value, list) or not flt.value:
+                conn.close()
+                raise HTTPException(400, "List value required")
+            vals = [parse_value(flt.column, v) for v in flt.value]
+            lo, hi = min(vals), max(vals)
+            return f"{col} BETWEEN ? AND ?", [lo, hi]
+        elif flt.op == "is_null":
+            return f"{col} IS NULL", []
+        elif flt.op == "is_not_null":
+            return f"{col} IS NOT NULL", []
         else:
             op_sql = {
                 "eq": "=",
@@ -191,16 +250,37 @@ def _run_query(table_name: str, req: QueryRequest):
                 "gte": ">=",
                 "like": "LIKE",
             }[flt.op]
-            value = flt.value
+            value = parse_value(flt.column, flt.value)
             if flt.op == "like":
                 value = f"%{value}%"
-            clauses.append(f"{col} {op_sql} ?")
-            params.append(value)
+            return f"{col} {op_sql} ?", [value]
+
+    def build_logic(group: LogicGroup):
+        items = group.logic
+        op = items[0]
+        clauses = []
+        params: List[Any] = []
+        for item in items[1:]:
+            if isinstance(item, LogicGroup):
+                c, p = build_logic(item)
+            elif isinstance(item, Filter):
+                c, p = build_filter(item)
+            else:
+                conn.close()
+                raise HTTPException(400, "Invalid logic element")
+            clauses.append(c)
+            params.extend(p)
+        return "(" + f" {op} ".join(clauses) + ")", params
+
+    logic_obj = req.logic
+    if logic_obj is None and req.filters:
+        logic_obj = LogicGroup(logic=[req.logical_operator, *req.filters])
 
     where_sql = ""
-    if clauses:
-        joiner = f" {req.logical_operator} "
-        where_sql = "WHERE " + joiner.join(clauses)
+    params: List[Any] = []
+    if logic_obj:
+        clause, params = build_logic(logic_obj)
+        where_sql = "WHERE " + clause
 
     order_sql = ""
     if req.order_by:
