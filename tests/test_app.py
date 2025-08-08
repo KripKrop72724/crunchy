@@ -156,3 +156,68 @@ def test_query_cache():
     )
     assert calls["n"] == 1
     main._run_query = orig
+
+
+def test_query_uppercase_and_order_by():
+    content = "ID,Name\n1,Alice\n2,Bob\n"
+    response = client.post(
+        "/upload",
+        headers={"X-API-Key": "changeme"},
+        files={"file": ("upper.csv", content, "text/csv")},
+    )
+    assert response.status_code == 200
+    job_id = response.json()["job_id"]
+    status = client.get(f"/status/{job_id}", headers={"X-API-Key": "changeme"}).json()
+    table = status["table"]
+
+    columns = client.get(
+        f"/tables/{table}/columns", headers={"X-API-Key": "changeme"}
+    ).json()["columns"]
+    assert columns == ["ID", "Name"]
+
+    body = {
+        "filters": [{"column": "Name", "op": "eq", "value": "Alice"}],
+        "order_by": {"column": "Name", "direction": "asc"},
+        "fields": ["ID", "Name"],
+        "limit": 10,
+        "offset": 0,
+    }
+    data = client.post(
+        f"/tables/{table}/query",
+        headers={"X-API-Key": "changeme"},
+        json=body,
+    )
+    assert data.status_code == 200
+    assert data.json()["rows"] == [{"ID": 1, "Name": "Alice"}]
+    assert data.json()["total"] == 1
+
+
+def test_query_invalid_identifier():
+    content = "id,First Name\n1,Alice\n"
+    response = client.post(
+        "/upload",
+        headers={"X-API-Key": "changeme"},
+        files={"file": ("bad.csv", content, "text/csv")},
+    )
+    assert response.status_code == 200
+    job_id = response.json()["job_id"]
+    status = client.get(f"/status/{job_id}", headers={"X-API-Key": "changeme"}).json()
+    table = status["table"]
+
+    columns = client.get(
+        f"/tables/{table}/columns", headers={"X-API-Key": "changeme"}
+    ).json()["columns"]
+    assert columns == ["id", "First Name"]
+
+    body = {
+        "filters": [{"column": "First Name", "op": "eq", "value": "Alice"}],
+        "limit": 10,
+        "offset": 0,
+    }
+    resp = client.post(
+        f"/tables/{table}/query",
+        headers={"X-API-Key": "changeme"},
+        json=body,
+    )
+    assert resp.status_code == 400
+    assert "Invalid identifier" in resp.json()["detail"]

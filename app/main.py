@@ -3,6 +3,7 @@ from pathlib import Path
 import asyncio
 import json
 from functools import lru_cache
+import re
 
 import aiofiles
 import duckdb
@@ -37,6 +38,17 @@ redis_client = redis.Redis.from_url(REDIS_URL, decode_responses=True)
 queue = Queue(connection=redis_client)
 
 
+# Regular expression for validating SQL identifiers
+IDENT_REGEX = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*$')
+
+
+def quote_ident(name: str) -> str:
+    """Validate and quote an SQL identifier."""
+    if not IDENT_REGEX.match(name):
+        raise HTTPException(400, f"Invalid identifier: {name!r}")
+    return f'"{name}"'
+
+
 # ---------------------------------------------------------------------------
 # Utility & startup
 # ---------------------------------------------------------------------------
@@ -63,21 +75,22 @@ def process_file(job_id: str, file_path: str):
     redis_client.hset(job_key, mapping={"status": "processing", "rows": 0})
     try:
         table = f"import_{job_id.replace('-', '_')}"
+        safe_table = quote_ident(table)
         conn = duckdb.connect(DB_PATH)
         ext = Path(file_path).suffix.lower()
 
         if ext == ".csv":
             conn.execute(
-                f"CREATE TABLE {table} AS SELECT * FROM read_csv_auto('{file_path}', SAMPLE_SIZE=-1)"
+                f"CREATE TABLE {safe_table} AS SELECT * FROM read_csv_auto('{file_path}', SAMPLE_SIZE=-1)"
             )
         elif ext == ".parquet":
             conn.execute(
-                f"CREATE TABLE {table} AS SELECT * FROM parquet_scan('{file_path}')"
+                f"CREATE TABLE {safe_table} AS SELECT * FROM parquet_scan('{file_path}')"
             )
         else:
             raise ValueError("Unsupported file type")
 
-        rows = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        rows = conn.execute(f"SELECT COUNT(*) FROM {safe_table}").fetchone()[0]
         redis_client.hset(job_key, "rows", rows)
         conn.close()
         redis_client.hset(job_key, mapping={"status": "completed", "table": table})
@@ -124,7 +137,9 @@ def _run_query(table_name: str, req: QueryRequest):
         conn.close()
         raise HTTPException(404, "Unknown table")
 
-    rows_info = conn.execute(f"PRAGMA table_info('{table_name}')").fetchall()
+    safe_table = quote_ident(table_name)
+
+    rows_info = conn.execute(f"PRAGMA table_info({safe_table})").fetchall()
     columns = [r[1] for r in rows_info]
     for f in req.filters:
         if f.column not in columns:
@@ -138,25 +153,26 @@ def _run_query(table_name: str, req: QueryRequest):
             if col not in columns:
                 conn.close()
                 raise HTTPException(400, f"Invalid column: {col}")
-        select_cols = ", ".join(req.fields)
+        select_cols = ", ".join(quote_ident(c) for c in req.fields)
     else:
         select_cols = "*"
 
     clauses = []
     params: List[Any] = []
     for flt in req.filters:
+        col = quote_ident(flt.column)
         if flt.op == "in":
             if not isinstance(flt.value, list) or not flt.value:
                 conn.close()
                 raise HTTPException(400, "List value required")
             placeholders = ", ".join("?" for _ in flt.value)
-            clauses.append(f"{flt.column} IN ({placeholders})")
+            clauses.append(f"{col} IN ({placeholders})")
             params.extend(flt.value)
         elif flt.op == "between":
             if not isinstance(flt.value, list) or len(flt.value) != 2:
                 conn.close()
                 raise HTTPException(400, "Two values required")
-            clauses.append(f"{flt.column} BETWEEN ? AND ?")
+            clauses.append(f"{col} BETWEEN ? AND ?")
             params.extend(flt.value)
         else:
             op_sql = {
@@ -171,7 +187,7 @@ def _run_query(table_name: str, req: QueryRequest):
             value = flt.value
             if flt.op == "like":
                 value = f"%{value}%"
-            clauses.append(f"{flt.column} {op_sql} ?")
+            clauses.append(f"{col} {op_sql} ?")
             params.append(value)
 
     where_sql = ""
@@ -181,13 +197,14 @@ def _run_query(table_name: str, req: QueryRequest):
 
     order_sql = ""
     if req.order_by:
-        order_sql = f"ORDER BY {req.order_by.column} {req.order_by.direction.upper()}"
+        col = quote_ident(req.order_by.column)
+        order_sql = f"ORDER BY {col} {req.order_by.direction.upper()}"
 
     data_sql = (
-        f"SELECT {select_cols} FROM {table_name} {where_sql} {order_sql} LIMIT ? OFFSET ?"
+        f"SELECT {select_cols} FROM {safe_table} {where_sql} {order_sql} LIMIT ? OFFSET ?"
     )
     data_params = params + [req.limit, req.offset]
-    count_sql = f"SELECT COUNT(*) FROM {table_name} {where_sql}"
+    count_sql = f"SELECT COUNT(*) FROM {safe_table} {where_sql}"
 
     cursor = conn.execute(data_sql, data_params)
     rows = cursor.fetchall()
@@ -270,7 +287,11 @@ async def table_columns(table_name: str, _: None = Depends(verify_api_key)):
     def _cols():
         conn = duckdb.connect(DB_PATH)
         try:
-            rows = conn.execute(f"PRAGMA table_info('{table_name}')").fetchall()
+            safe_table = quote_ident(table_name)
+            rows = conn.execute(f"PRAGMA table_info({safe_table})").fetchall()
+        except HTTPException:
+            conn.close()
+            raise
         except Exception:
             conn.close()
             raise HTTPException(404, "Unknown table")
