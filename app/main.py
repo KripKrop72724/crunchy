@@ -22,7 +22,7 @@ from fastapi import (
     UploadFile,
     WebSocket,
 )
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 from .config import API_KEY, DB_PATH, REDIS_URL, UPLOAD_DIR
@@ -48,6 +48,12 @@ def quote_ident(name: str) -> str:
     if not IDENT_REGEX.match(name):
         raise HTTPException(400, f"Invalid identifier: {name!r}")
     return f'"{name}"'
+
+
+def _json_default(obj: Any):
+    if isinstance(obj, (date, datetime)):
+        return obj.isoformat()
+    raise TypeError
 
 
 # ---------------------------------------------------------------------------
@@ -166,14 +172,7 @@ class QueryRequest(BaseModel):
         return v
 
 
-@lru_cache(maxsize=128)
-def _run_query_cached(table_name: str, req_json: str):
-    req_dict = json.loads(req_json)
-    req = QueryRequest(**req_dict)
-    return _run_query(table_name, req)
-
-
-def _run_query(table_name: str, req: QueryRequest):
+def _prepare_query(table_name: str, req: QueryRequest):
     conn = duckdb.connect(database=DB_PATH, read_only=True)
     tables = [r[0] for r in conn.execute("SHOW TABLES").fetchall()]
     if table_name not in tables:
@@ -292,7 +291,18 @@ def _run_query(table_name: str, req: QueryRequest):
     )
     data_params = params + [req.limit, req.offset]
     count_sql = f"SELECT COUNT(*) FROM {safe_table} {where_sql}"
+    return conn, data_sql, data_params, count_sql, params
 
+
+@lru_cache(maxsize=128)
+def _run_query_cached(table_name: str, req_json: str):
+    req_dict = json.loads(req_json)
+    req = QueryRequest(**req_dict)
+    return _run_query(table_name, req)
+
+
+def _run_query(table_name: str, req: QueryRequest):
+    conn, data_sql, data_params, count_sql, params = _prepare_query(table_name, req)
     cursor = conn.execute(data_sql, data_params)
     rows = cursor.fetchall()
     col_names = [d[0] for d in cursor.description]
@@ -400,6 +410,27 @@ async def query_table(
     req_json = json.dumps(req.dict(), sort_keys=True)
     rows, total = await asyncio.to_thread(_run_query_cached, table_name, req_json)
     return {"rows": rows, "total": total}
+
+
+@app.post("/tables/{table_name}/stream")
+async def stream_table(
+    table_name: str, req: QueryRequest, _: None = Depends(verify_api_key)
+):
+    conn, data_sql, data_params, _, _ = _prepare_query(table_name, req)
+
+    def generator():
+        cursor = conn.execute(data_sql, data_params)
+        cols = [d[0] for d in cursor.description]
+        try:
+            while True:
+                row = cursor.fetchone()
+                if row is None:
+                    break
+                yield json.dumps(dict(zip(cols, row)), default=_json_default) + "\n"
+        finally:
+            conn.close()
+
+    return StreamingResponse(generator(), media_type="application/x-ndjson")
 
 
 @app.websocket("/ws/status/{job_id}")
