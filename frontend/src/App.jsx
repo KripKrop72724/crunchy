@@ -9,7 +9,39 @@ function App() {
   const [apiKey, setApiKey] = useState('');
   const [status, setStatus] = useState(null);
   const [progress, setProgress] = useState(0);
+  const [columns, setColumns] = useState([]);
+  const [rows, setRows] = useState([]);
+  const [filters, setFilters] = useState([]);
   const wsRef = useRef(null);
+
+  const fetchData = async (table, flts = []) => {
+    const headers = { 'X-API-Key': apiKey };
+    const colRes = await axios.get(`${API_URL}/tables/${table}/columns`, {
+      headers,
+    });
+    setColumns(colRes.data.columns);
+    const queryRes = await axios.post(
+      `${API_URL}/tables/${table}/query`,
+      { filters: flts, limit: 20, offset: 0, fields: colRes.data.columns },
+      { headers }
+    );
+    setRows(queryRes.data.rows);
+  };
+
+  const applyFilters = async () => {
+    if (!status?.table) return;
+    await fetchData(status.table, filters);
+  };
+
+  const addFilter = () => {
+    setFilters([...filters, { column: '', op: 'eq', value: '' }]);
+  };
+
+  const updateFilter = (idx, field, value) => {
+    const copy = [...filters];
+    copy[idx][field] = value;
+    setFilters(copy);
+  };
 
   const upload = async () => {
     if (!file) return;
@@ -35,6 +67,9 @@ function App() {
       ws.onmessage = (ev) => {
         const data = JSON.parse(ev.data);
         setStatus(data);
+        if (data.status === 'completed' && data.table) {
+          fetchData(data.table);
+        }
       };
       ws.onerror = () => {
         setStatus({ status: 'failed', error: 'WebSocket error' });
@@ -73,6 +108,68 @@ function App() {
           {status.rows !== undefined && <p>Rows: {status.rows}</p>}
           {status.error && <p>Error: {status.error}</p>}
           {status.table && <p>Table: {status.table}</p>}
+        </div>
+      )}
+
+      {status?.table && (
+        <div>
+          <h2>Data Preview</h2>
+          <button onClick={addFilter}>Add Filter</button>
+          {filters.map((f, idx) => (
+            <div key={idx}>
+              <select
+                data-testid={`column-${idx}`}
+                value={f.column}
+                onChange={(e) => updateFilter(idx, 'column', e.target.value)}
+              >
+                <option value="">Column</option>
+                {columns.map((c) => (
+                  <option key={c} value={c}>
+                    {c}
+                  </option>
+                ))}
+              </select>
+              <select
+                data-testid={`op-${idx}`}
+                value={f.op}
+                onChange={(e) => updateFilter(idx, 'op', e.target.value)}
+              >
+                <option value="eq">=</option>
+                <option value="neq">!=</option>
+                <option value="lt">&lt;</option>
+                <option value="lte">&le;</option>
+                <option value="gt">&gt;</option>
+                <option value="gte">&ge;</option>
+                <option value="like">like</option>
+              </select>
+              <input
+                data-testid={`value-${idx}`}
+                value={f.value}
+                onChange={(e) => updateFilter(idx, 'value', e.target.value)}
+              />
+            </div>
+          ))}
+          {filters.length > 0 && (
+            <button onClick={applyFilters}>Apply Filters</button>
+          )}
+          <table>
+            <thead>
+              <tr>
+                {columns.map((c) => (
+                  <th key={c}>{c}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((row, i) => (
+                <tr key={i}>
+                  {columns.map((c) => (
+                    <td key={c}>{row[c]}</td>
+                  ))}
+                </tr>
+              ))}
+            </tbody>
+          </table>
         </div>
       )}
     </div>

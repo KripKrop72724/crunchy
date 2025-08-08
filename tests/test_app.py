@@ -85,3 +85,74 @@ def test_unsupported_file_type():
     status = client.get(f"/status/{job_id}", headers={"X-API-Key": "changeme"}).json()
     assert status["status"] == "failed"
     assert "Unsupported file type" in status["error"]
+
+
+def test_query_endpoints():
+    content = "id,name\n1,Alice\n2,Bob\n3,Carol\n"
+    response = client.post(
+        "/upload",
+        headers={"X-API-Key": "changeme"},
+        files={"file": ("test.csv", content, "text/csv")},
+    )
+    assert response.status_code == 200
+    job_id = response.json()["job_id"]
+    status = client.get(f"/status/{job_id}", headers={"X-API-Key": "changeme"}).json()
+    assert status["status"] == "completed"
+    table = status["table"]
+
+    tables = client.get("/tables", headers={"X-API-Key": "changeme"}).json()["tables"]
+    assert table in tables
+
+    columns = client.get(
+        f"/tables/{table}/columns", headers={"X-API-Key": "changeme"}
+    ).json()["columns"]
+    assert columns == ["id", "name"]
+
+    body = {
+        "filters": [{"column": "name", "op": "eq", "value": "Alice"}],
+        "limit": 10,
+        "offset": 0,
+        "fields": ["id"],
+    }
+    data = client.post(
+        f"/tables/{table}/query",
+        headers={"X-API-Key": "changeme"},
+        json=body,
+    ).json()
+    assert data["total"] == 1
+    assert data["rows"] == [{"id": 1}]
+
+
+def test_query_cache():
+    content = "id,name\n1,Alice\n2,Bob\n"
+    response = client.post(
+        "/upload",
+        headers={"X-API-Key": "changeme"},
+        files={"file": ("cache.csv", content, "text/csv")},
+    )
+    job_id = response.json()["job_id"]
+    status = client.get(f"/status/{job_id}", headers={"X-API-Key": "changeme"}).json()
+    table = status["table"]
+
+    main._run_query_cached.cache_clear()
+    calls = {"n": 0}
+    orig = main._run_query
+
+    def wrapped(table_name, req):
+        calls["n"] += 1
+        return orig(table_name, req)
+
+    main._run_query = wrapped
+    body = {"filters": [], "limit": 10, "offset": 0}
+    client.post(
+        f"/tables/{table}/query",
+        headers={"X-API-Key": "changeme"},
+        json=body,
+    )
+    client.post(
+        f"/tables/{table}/query",
+        headers={"X-API-Key": "changeme"},
+        json=body,
+    )
+    assert calls["n"] == 1
+    main._run_query = orig

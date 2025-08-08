@@ -9,7 +9,7 @@ Backend service for uploading massive Excel files, tracking progress via Redis, 
 - **API key authentication** on protected endpoints.
 - **Health check** endpoint.
 - Packaged with **Docker** and orchestrated via **Docker Compose**.
-- Simple **React frontend** for authenticated uploads with real-time progress via WebSockets.
+ - Simple **React frontend** for authenticated uploads, real-time progress, and filtering uploaded data via the query APIs.
 
 ## Configuration
 Create a `.env` file (see `.env.example`):
@@ -27,7 +27,7 @@ docker-compose up --build
 ```
 The API will be available at `http://localhost:8000` and the frontend at `http://localhost:5173`.
 
-Open the frontend in your browser, supply the API key, select a file, and click **Upload**. Upload progress and row ingestion counts will update live using the WebSocket status API.
+Open the frontend in your browser, supply the API key, select a file, and click **Upload**. When the upload finishes the first few rows are displayed and you can add filters to refine the results via the new query endpoints. Upload progress and row ingestion counts update live using the WebSocket status API.
 
 ## API
 ### Upload Excel file
@@ -56,6 +56,47 @@ Response example:
   "error": null
 }
 ```
+
+### List tables
+`GET /tables` with `X-API-Key` header.
+
+Returns:
+```json
+{"tables": ["import_123", ...]}
+```
+
+### List columns for a table
+`GET /tables/{table}/columns` with `X-API-Key` header.
+
+Returns:
+```json
+{"columns": ["id", "name", ...]}
+```
+
+### Query table with filters
+`POST /tables/{table}/query` with `X-API-Key` header.
+
+Body example:
+```json
+{
+  "filters": [
+    {"column": "age", "op": "gte", "value": 30},
+    {"column": "country", "op": "eq", "value": "UAE"}
+  ],
+  "logical_operator": "AND",
+  "order_by": {"column": "age", "direction": "desc"},
+  "limit": 100,
+  "offset": 0,
+  "fields": ["id", "age", "country"]
+}
+```
+
+Response:
+```json
+{"rows": [{"id": 1, "age": 42, "country": "UAE"}], "total": 1}
+```
+
+Repeated queries are cached in-memory for speed, and specifying `fields` trims unused columns to reduce I/O.
 
 ### Health
 `GET /health`
