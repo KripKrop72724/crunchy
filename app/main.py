@@ -2,7 +2,7 @@ import uuid
 from pathlib import Path
 import asyncio
 import json
-from functools import lru_cache
+import hashlib
 import re
 
 import aiofiles
@@ -37,6 +37,7 @@ app.add_middleware(
 )
 redis_client = redis.Redis.from_url(REDIS_URL, decode_responses=True)
 queue = Queue(connection=redis_client)
+QUERY_CACHE_TTL = 60
 
 
 # Regular expression for validating SQL identifiers
@@ -294,13 +295,6 @@ def _prepare_query(table_name: str, req: QueryRequest):
     return conn, data_sql, data_params, count_sql, params
 
 
-@lru_cache(maxsize=128)
-def _run_query_cached(table_name: str, req_json: str):
-    req_dict = json.loads(req_json)
-    req = QueryRequest(**req_dict)
-    return _run_query(table_name, req)
-
-
 def _run_query(table_name: str, req: QueryRequest):
     conn, data_sql, data_params, count_sql, params = _prepare_query(table_name, req)
     cursor = conn.execute(data_sql, data_params)
@@ -408,8 +402,14 @@ async def query_table(
     table_name: str, req: QueryRequest, _: None = Depends(verify_api_key)
 ):
     req_json = json.dumps(req.dict(), sort_keys=True)
-    rows, total = await asyncio.to_thread(_run_query_cached, table_name, req_json)
-    return {"rows": rows, "total": total}
+    key = hashlib.sha256((req_json + table_name).encode()).hexdigest()
+    cached = redis_client.get(key)
+    if cached:
+        return json.loads(cached)
+    rows, total = await asyncio.to_thread(_run_query, table_name, req)
+    result = {"rows": rows, "total": total}
+    redis_client.setex(key, QUERY_CACHE_TTL, json.dumps(result))
+    return result
 
 
 @app.post("/tables/{table_name}/stream")
