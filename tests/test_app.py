@@ -6,6 +6,8 @@ import duckdb
 from rq import Queue
 import tempfile
 import json
+import pytest
+import redis
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 import app.main as main
@@ -157,6 +159,121 @@ def test_query_cache():
     )
     assert calls["n"] == 1
     main._run_query = orig
+
+
+def test_query_cache_get_error(monkeypatch):
+    content = "id,name\n1,Alice\n2,Bob\n"
+    response = client.post(
+        "/upload",
+        headers={"X-API-Key": "changeme"},
+        files={"file": ("errget.csv", content, "text/csv")},
+    )
+    job_id = response.json()["job_id"]
+    status = client.get(f"/status/{job_id}", headers={"X-API-Key": "changeme"}).json()
+    table = status["table"]
+
+    calls = {"n": 0}
+    orig_run = main._run_query
+
+    def wrapped(table_name, req):
+        calls["n"] += 1
+        return orig_run(table_name, req)
+
+    monkeypatch.setattr(main, "_run_query", wrapped)
+
+    def boom(*args, **kwargs):
+        raise redis.exceptions.ConnectionError("boom")
+
+    monkeypatch.setattr(main.redis_client, "get", boom)
+
+    body = {"filters": [], "limit": 10, "offset": 0}
+    r1 = client.post(
+        f"/tables/{table}/query",
+        headers={"X-API-Key": "changeme"},
+        json=body,
+    )
+    assert r1.status_code == 200
+    assert r1.json()["total"] == 2
+    r2 = client.post(
+        f"/tables/{table}/query",
+        headers={"X-API-Key": "changeme"},
+        json=body,
+    )
+    assert r2.status_code == 200
+    assert r2.json()["total"] == 2
+    assert calls["n"] == 2
+    monkeypatch.setattr(main, "_run_query", orig_run)
+
+
+def test_query_cache_setex_error(monkeypatch):
+    content = "id,name\n1,Alice\n2,Bob\n"
+    response = client.post(
+        "/upload",
+        headers={"X-API-Key": "changeme"},
+        files={"file": ("errset.csv", content, "text/csv")},
+    )
+    job_id = response.json()["job_id"]
+    status = client.get(f"/status/{job_id}", headers={"X-API-Key": "changeme"}).json()
+    table = status["table"]
+
+    calls = {"n": 0}
+    orig_run = main._run_query
+
+    def wrapped(table_name, req):
+        calls["n"] += 1
+        return orig_run(table_name, req)
+
+    monkeypatch.setattr(main, "_run_query", wrapped)
+
+    def boom(*args, **kwargs):
+        raise redis.exceptions.ConnectionError("boom")
+
+    monkeypatch.setattr(main.redis_client, "setex", boom)
+
+    body = {"filters": [], "limit": 10, "offset": 0}
+    r1 = client.post(
+        f"/tables/{table}/query",
+        headers={"X-API-Key": "changeme"},
+        json=body,
+    )
+    assert r1.status_code == 200
+    assert r1.json()["total"] == 2
+    r2 = client.post(
+        f"/tables/{table}/query",
+        headers={"X-API-Key": "changeme"},
+        json=body,
+    )
+    assert r2.status_code == 200
+    assert r2.json()["total"] == 2
+    assert calls["n"] == 2
+    monkeypatch.setattr(main, "_run_query", orig_run)
+
+
+def test_query_cache_redis_unavailable(monkeypatch):
+    content = "id,name\n1,Alice\n2,Bob\n"
+    response = client.post(
+        "/upload",
+        headers={"X-API-Key": "changeme"},
+        files={"file": ("errboth.csv", content, "text/csv")},
+    )
+    job_id = response.json()["job_id"]
+    status = client.get(f"/status/{job_id}", headers={"X-API-Key": "changeme"}).json()
+    table = status["table"]
+
+    def boom(*args, **kwargs):
+        raise redis.exceptions.ConnectionError("boom")
+
+    monkeypatch.setattr(main.redis_client, "get", boom)
+    monkeypatch.setattr(main.redis_client, "setex", boom)
+
+    body = {"filters": [], "limit": 10, "offset": 0}
+    resp = client.post(
+        f"/tables/{table}/query",
+        headers={"X-API-Key": "changeme"},
+        json=body,
+    )
+    assert resp.status_code == 200
+    assert resp.json()["total"] == 2
 
 
 def test_query_order_by_normalized():

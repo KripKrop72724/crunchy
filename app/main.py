@@ -8,6 +8,7 @@ import re
 import aiofiles
 import duckdb
 import redis
+from redis.exceptions import RedisError
 from rq import Queue
 from typing import Any, List, Literal, Optional, Union
 from datetime import date, datetime
@@ -411,12 +412,19 @@ async def query_table(
 ):
     req_json = json.dumps(req.dict(), sort_keys=True)
     key = hashlib.sha256((req_json + table_name).encode()).hexdigest()
-    cached = redis_client.get(key)
+    cached = None
+    try:
+        cached = redis_client.get(key)
+    except RedisError:
+        pass
     if cached:
         return json.loads(cached)
     rows, total = await asyncio.to_thread(_run_query, table_name, req)
     result = {"rows": rows, "total": total}
-    redis_client.setex(key, QUERY_CACHE_TTL, json.dumps(result))
+    try:
+        redis_client.setex(key, QUERY_CACHE_TTL, json.dumps(result))
+    except RedisError:
+        pass
     return result
 
 
