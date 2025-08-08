@@ -9,6 +9,15 @@ services:
       - "8000:8000"
     depends_on:
       - redis
+  frontend:
+    build: ./frontend
+    ports:
+      - "5173:5173"
+    environment:
+      - VITE_API_URL=http://api:8000
+      - VITE_WS_URL=ws://api:8000
+    depends_on:
+      - api
   redis:
     image: redis:7-alpine
     ports:

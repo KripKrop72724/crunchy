@@ -1,6 +1,6 @@
 # crunchy
 
-Backend service for uploading massive Excel files, tracking progress via Redis, and ingesting into DuckDB.
+Backend service for uploading massive Excel files, tracking progress via Redis, and ingesting into DuckDB. A simple React frontend is included for uploading files and monitoring progress in real time.
 
 ## Features
 - **Streaming uploads** of arbitrarily large Excel files without exhausting memory.
@@ -9,6 +9,7 @@ Backend service for uploading massive Excel files, tracking progress via Redis, 
 - **API key authentication** on protected endpoints.
 - **Health check** endpoint.
 - Packaged with **Docker** and orchestrated via **Docker Compose**.
+- Simple **React frontend** for authenticated uploads with real-time progress via WebSockets.
 
 ## Configuration
 Create a `.env` file (see `.env.example`):
@@ -24,7 +25,9 @@ REDIS_URL=redis://redis:6379/0
 ```bash
 docker-compose up --build
 ```
-The API will be available at `http://localhost:8000`.
+The API will be available at `http://localhost:8000` and the frontend at `http://localhost:5173`.
+
+Open the frontend in your browser, supply the API key, select a file, and click **Upload**. Upload progress and row ingestion counts will update live using the WebSocket status API.
 
 ## API
 ### Upload Excel file
@@ -67,4 +70,11 @@ Install dependencies and run tests:
 ```bash
 pip install -r requirements.txt
 pytest
+```
+
+Frontend tests use Vitest:
+```bash
+cd frontend
+npm install
+npm test
 ```
