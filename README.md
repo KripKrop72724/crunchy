@@ -96,6 +96,33 @@ Response:
 {"rows": [{"id": 1, "age": 42, "country": "UAE"}], "total": 1}
 ```
 
+Supported filter operators include:
+
+- `eq`, `neq`, `lt`, `lte`, `gt`, `gte`
+- `like` (case-sensitive contains)
+- `ilike` (case-insensitive contains)
+- `ieq` (case-insensitive equals)
+- `in`, `between`, `in_range`
+- `is_null`, `is_not_null`
+
+Examples:
+
+- Case-insensitive contains:
+
+  ```json
+  { "column": "name", "op": "ilike", "value": "smith" }
+  ```
+
+  generates `WHERE "name" ILIKE '%smith%'`
+
+- Case-insensitive equals:
+
+  ```json
+  { "column": "status", "op": "ieq", "value": "ACTIVE" }
+  ```
+
+  generates `WHERE LOWER("status") = LOWER('ACTIVE')`
+
 Repeated queries are cached in Redis for speed, and specifying `fields` trims unused columns to reduce I/O.
 
 ### Stream query results

@@ -287,6 +287,8 @@ def test_filter_operations():
     assert q({"filters": [{"column": "age", "op": "gt", "value": 30}], "fields": ["id"]})["rows"] == [{"id": 4}]
     assert q({"filters": [{"column": "age", "op": "gte", "value": 30}], "fields": ["id"]})["rows"] == [{"id": 1}, {"id": 4}]
     assert q({"filters": [{"column": "name", "op": "like", "value": "li"}], "fields": ["id"]})["rows"] == [{"id": 1}]
+    assert q({"filters": [{"column": "name", "op": "ilike", "value": "ALI"}], "fields": ["id"]})["rows"] == [{"id": 1}]
+    assert q({"filters": [{"column": "name", "op": "ieq", "value": "ALICE"}], "fields": ["id"]})["rows"] == [{"id": 1}]
     assert q({"filters": [{"column": "id", "op": "in", "value": [1, 3]}], "fields": ["id"]})["rows"] == [{"id": 1}, {"id": 3}]
     assert q({"filters": [{"column": "age", "op": "between", "value": [20, 35]}], "fields": ["id"]})["rows"] == [{"id": 1}, {"id": 3}]
     assert q({"filters": [{"column": "age", "op": "in_range", "value": [40, 25, 30]}], "fields": ["id"]})["rows"] == [{"id": 1}, {"id": 3}, {"id": 4}]
