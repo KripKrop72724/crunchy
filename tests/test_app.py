@@ -135,7 +135,7 @@ def test_query_cache():
     status = client.get(f"/status/{job_id}", headers={"X-API-Key": "changeme"}).json()
     table = status["table"]
 
-    main._run_query_cached.cache_clear()
+    main.redis_client.flushall()
     calls = {"n": 0}
     orig = main._run_query
 

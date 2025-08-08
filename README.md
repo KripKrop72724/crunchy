@@ -96,7 +96,7 @@ Response:
 {"rows": [{"id": 1, "age": 42, "country": "UAE"}], "total": 1}
 ```
 
-Repeated queries are cached in-memory for speed, and specifying `fields` trims unused columns to reduce I/O.
+Repeated queries are cached in Redis for speed, and specifying `fields` trims unused columns to reduce I/O.
 
 ### Stream query results
 `POST /tables/{table}/stream` with `X-API-Key` header.
