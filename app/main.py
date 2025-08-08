@@ -1,14 +1,12 @@
 import uuid
 from pathlib import Path
 import asyncio
-import csv
 
 import aiofiles
 import duckdb
 import redis
-import pyarrow.parquet as pq
+from rq import Queue
 from fastapi import (
-    BackgroundTasks,
     Depends,
     FastAPI,
     File,
@@ -32,6 +30,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 redis_client = redis.Redis.from_url(REDIS_URL, decode_responses=True)
+queue = Queue(connection=redis_client)
 
 
 # ---------------------------------------------------------------------------
@@ -62,48 +61,20 @@ def process_file(job_id: str, file_path: str):
         table = f"import_{job_id.replace('-', '_')}"
         conn = duckdb.connect(DB_PATH)
         ext = Path(file_path).suffix.lower()
-        rows = 0
-        chunk_size = 10000
 
         if ext == ".csv":
-            with open(file_path, newline="") as f:
-                reader = csv.reader(f)
-                header = next(reader)
-                columns = ", ".join([f'"{c}" TEXT' for c in header])
-                conn.execute(f"CREATE TABLE {table} ({columns})")
-                placeholders = ",".join(["?"] * len(header))
-                chunk = []
-                for row in reader:
-                    chunk.append(row)
-                    if len(chunk) >= chunk_size:
-                        conn.executemany(
-                            f"INSERT INTO {table} VALUES ({placeholders})", chunk
-                        )
-                        rows += len(chunk)
-                        redis_client.hset(job_key, "rows", rows)
-                        chunk = []
-                if chunk:
-                    conn.executemany(
-                        f"INSERT INTO {table} VALUES ({placeholders})", chunk
-                    )
-                    rows += len(chunk)
-                    redis_client.hset(job_key, "rows", rows)
-
-        elif ext == ".parquet":
-            parquet_file = pq.ParquetFile(file_path)
             conn.execute(
-                f"CREATE TABLE {table} AS SELECT * FROM read_parquet('{file_path}') LIMIT 0"
+                f"CREATE TABLE {table} AS SELECT * FROM read_csv_auto('{file_path}', SAMPLE_SIZE=-1)"
             )
-            for batch in parquet_file.iter_batches(batch_size=chunk_size):
-                conn.register("batch", batch)
-                conn.execute(f"INSERT INTO {table} SELECT * FROM batch")
-                conn.unregister("batch")
-                rows += batch.num_rows
-                redis_client.hset(job_key, "rows", rows)
-
+        elif ext == ".parquet":
+            conn.execute(
+                f"CREATE TABLE {table} AS SELECT * FROM parquet_scan('{file_path}')"
+            )
         else:
             raise ValueError("Unsupported file type")
 
+        rows = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        redis_client.hset(job_key, "rows", rows)
         conn.close()
         redis_client.hset(job_key, mapping={"status": "completed", "table": table})
     except Exception as e:  # pragma: no cover - error path
@@ -117,7 +88,6 @@ def process_file(job_id: str, file_path: str):
 @app.post("/upload")
 async def upload(
     request: Request,
-    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     _: None = Depends(verify_api_key),
 ):
@@ -148,7 +118,7 @@ async def upload(
         raise HTTPException(500, "Failed to upload file.")
 
     redis_client.hset(job_key, mapping={"status": "queued"})
-    background_tasks.add_task(process_file, job_id, str(dest_path))
+    queue.enqueue(process_file, job_id, str(dest_path))
     return {"job_id": job_id}
 
 
