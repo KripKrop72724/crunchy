@@ -128,6 +128,8 @@ class Filter(BaseModel):
         "gt",
         "gte",
         "like",
+        "ilike",
+        "ieq",
         "in",
         "between",
         "in_range",
@@ -240,6 +242,12 @@ def _prepare_query(table_name: str, req: QueryRequest):
             return f"{col} IS NULL", []
         elif flt.op == "is_not_null":
             return f"{col} IS NOT NULL", []
+        elif flt.op == "ilike":
+            v = flt.value if isinstance(flt.value, str) else str(flt.value)
+            return f"{col} ILIKE ?", [f"%{v}%"]
+        elif flt.op == "ieq":
+            v = flt.value if isinstance(flt.value, str) else str(flt.value)
+            return f"LOWER({col}) = LOWER(?)", [v]
         else:
             op_sql = {
                 "eq": "=",

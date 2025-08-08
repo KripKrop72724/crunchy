@@ -141,6 +141,8 @@ function App() {
                 <option value="gt">&gt;</option>
                 <option value="gte">&ge;</option>
                 <option value="like">like</option>
+                <option value="ilike">ilike</option>
+                <option value="ieq">ieq</option>
               </select>
               <input
                 data-testid={`value-${idx}`}
