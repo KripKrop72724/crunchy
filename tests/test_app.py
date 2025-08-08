@@ -248,3 +248,109 @@ def test_column_normalization_duplicate_conflict():
     status = client.get(f"/status/{job_id}", headers={"X-API-Key": "changeme"}).json()
     assert status["status"] == "failed"
     assert "already exists" in status["error"].lower()
+
+
+def create_filter_table():
+    content = (
+        "id,name,age,joined\n"
+        "1,Alice,30,2024-01-01\n"
+        "2,Bob,,2024-05-15\n"
+        "3,Carol,25,2025-08-01\n"
+        "4,Dan,40,2023-12-31\n"
+    )
+    response = client.post(
+        "/upload",
+        headers={"X-API-Key": "changeme"},
+        files={"file": ("filters.csv", content, "text/csv")},
+    )
+    job_id = response.json()["job_id"]
+    status = client.get(
+        f"/status/{job_id}", headers={"X-API-Key": "changeme"}
+    ).json()
+    assert status["status"] == "completed"
+    return status["table"]
+
+
+def test_filter_operations():
+    table = create_filter_table()
+    h = {"X-API-Key": "changeme"}
+
+    def q(body):
+        body.update({"limit": 100, "offset": 0})
+        return client.post(f"/tables/{table}/query", headers=h, json=body).json()
+
+    assert q({"filters": [{"column": "age", "op": "eq", "value": 30}], "fields": ["id"]})["rows"] == [{"id": 1}]
+    assert q({"filters": [{"column": "age", "op": "neq", "value": 30}], "fields": ["id"]})["rows"] == [{"id": 3}, {"id": 4}]
+    assert q({"filters": [{"column": "age", "op": "lt", "value": 30}], "fields": ["id"]})["rows"] == [{"id": 3}]
+    assert q({"filters": [{"column": "age", "op": "lte", "value": 30}], "fields": ["id"]})["rows"] == [{"id": 1}, {"id": 3}]
+    assert q({"filters": [{"column": "age", "op": "gt", "value": 30}], "fields": ["id"]})["rows"] == [{"id": 4}]
+    assert q({"filters": [{"column": "age", "op": "gte", "value": 30}], "fields": ["id"]})["rows"] == [{"id": 1}, {"id": 4}]
+    assert q({"filters": [{"column": "name", "op": "like", "value": "li"}], "fields": ["id"]})["rows"] == [{"id": 1}]
+    assert q({"filters": [{"column": "id", "op": "in", "value": [1, 3]}], "fields": ["id"]})["rows"] == [{"id": 1}, {"id": 3}]
+    assert q({"filters": [{"column": "age", "op": "between", "value": [20, 35]}], "fields": ["id"]})["rows"] == [{"id": 1}, {"id": 3}]
+    assert q({"filters": [{"column": "age", "op": "in_range", "value": [40, 25, 30]}], "fields": ["id"]})["rows"] == [{"id": 1}, {"id": 3}, {"id": 4}]
+    assert q({"filters": [{"column": "age", "op": "is_null"}], "fields": ["id"]})["rows"] == [{"id": 2}]
+    assert q({"filters": [{"column": "age", "op": "is_not_null"}], "fields": ["id"]})["rows"] == [{"id": 1}, {"id": 3}, {"id": 4}]
+    assert q({"filters": [{"column": "joined", "op": "eq", "value": "2025-08-01"}], "fields": ["id"]})["rows"] == [{"id": 3}]
+    assert q({"filters": [{"column": "joined", "op": "gt", "value": "2024-01-01"}], "fields": ["id"]})["rows"] == [{"id": 2}, {"id": 3}]
+
+
+def test_filter_invalid_cases():
+    table = create_filter_table()
+    h = {"X-API-Key": "changeme"}
+    body = {
+        "filters": [{"column": "age", "op": "in_range", "value": []}],
+        "limit": 10,
+        "offset": 0,
+    }
+    resp = client.post(f"/tables/{table}/query", headers=h, json=body)
+    assert resp.status_code == 400
+
+    bad_date = {
+        "filters": [{"column": "joined", "op": "eq", "value": "not-a-date"}],
+        "limit": 10,
+        "offset": 0,
+    }
+    resp = client.post(f"/tables/{table}/query", headers=h, json=bad_date)
+    assert resp.status_code == 400
+
+
+def test_nested_logic():
+    table = create_filter_table()
+    h = {"X-API-Key": "changeme"}
+    body = {
+        "logic": [
+            "OR",
+            {
+                "logic": [
+                    "AND",
+                    {"column": "name", "op": "like", "value": "Al"},
+                    {"column": "age", "op": "eq", "value": 30},
+                ]
+            },
+            {
+                "logic": [
+                    "AND",
+                    {"column": "age", "op": "is_null"},
+                    {"column": "joined", "op": "lt", "value": "2025-01-01"},
+                ]
+            },
+        ],
+        "fields": ["id"],
+        "limit": 10,
+        "offset": 0,
+    }
+    data = client.post(f"/tables/{table}/query", headers=h, json=body).json()
+    assert data["rows"] == [{"id": 1}, {"id": 2}]
+
+
+def test_invalid_logic_operator():
+    table = create_filter_table()
+    h = {"X-API-Key": "changeme"}
+    body = {
+        "logic": ["X", {"column": "age", "op": "eq", "value": 30}],
+        "limit": 10,
+        "offset": 0,
+    }
+    resp = client.post(f"/tables/{table}/query", headers=h, json=body)
+    assert resp.status_code == 422
