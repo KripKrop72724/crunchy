@@ -98,6 +98,24 @@ Response:
 
 Repeated queries are cached in-memory for speed, and specifying `fields` trims unused columns to reduce I/O.
 
+### Stream query results
+`POST /tables/{table}/stream` with `X-API-Key` header.
+
+This returns an `application/x-ndjson` stream where each line is a JSON object representing a row. Example:
+
+```
+curl -N -H "X-API-Key: changeme" -X POST \
+  http://localhost:8000/tables/mytable/stream \
+  -d '{"limit":1000,"offset":0}'
+```
+
+```
+{"id":1,"name":"Alice"}
+{"id":2,"name":"Bob"}
+```
+
+Use this for exporting large result sets without loading them all into memory.
+
 ### Health
 `GET /health`
 

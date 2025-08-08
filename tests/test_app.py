@@ -5,6 +5,7 @@ from pathlib import Path
 import duckdb
 from rq import Queue
 import tempfile
+import json
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 import app.main as main
@@ -354,3 +355,41 @@ def test_invalid_logic_operator():
     }
     resp = client.post(f"/tables/{table}/query", headers=h, json=body)
     assert resp.status_code == 422
+
+
+def _parse_ndjson(resp):
+    lines = resp.text.strip().splitlines()
+    return [json.loads(l) for l in lines] if lines else []
+
+
+def test_stream_basic():
+    table = create_filter_table()
+    h = {"X-API-Key": "changeme"}
+    body = {"limit": 100, "offset": 0}
+    resp = client.post(f"/tables/{table}/stream", headers=h, json=body)
+    assert resp.status_code == 200
+    rows = _parse_ndjson(resp)
+    assert len(rows) == 4
+    assert rows[0]["name"] == "Alice"
+
+
+def test_stream_empty_result():
+    table = create_filter_table()
+    h = {"X-API-Key": "changeme"}
+    body = {
+        "filters": [{"column": "name", "op": "eq", "value": "ZZZ"}],
+        "limit": 100,
+        "offset": 0,
+    }
+    resp = client.post(f"/tables/{table}/stream", headers=h, json=body)
+    assert resp.status_code == 200
+    assert resp.text == ""
+
+
+def test_stream_unknown_table():
+    resp = client.post(
+        "/tables/unknown/stream",
+        headers={"X-API-Key": "changeme"},
+        json={"limit": 1, "offset": 0},
+    )
+    assert resp.status_code == 404
