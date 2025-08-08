@@ -47,7 +47,7 @@ def test_csv_upload():
     status = client.get(f"/status/{job_id}", headers={"X-API-Key": "changeme"}).json()
     assert status["status"] == "completed"
     assert status["rows"] == 2
-    conn = duckdb.connect(main.DB_PATH)
+    conn = duckdb.connect(database=main.DB_PATH, read_only=True)
     rows = conn.execute(f"SELECT COUNT(*) FROM {status['table']}").fetchone()[0]
     conn.close()
     assert rows == 2
@@ -158,7 +158,7 @@ def test_query_cache():
     main._run_query = orig
 
 
-def test_query_uppercase_and_order_by():
+def test_query_order_by_normalized():
     content = "ID,Name\n1,Alice\n2,Bob\n"
     response = client.post(
         "/upload",
@@ -173,12 +173,12 @@ def test_query_uppercase_and_order_by():
     columns = client.get(
         f"/tables/{table}/columns", headers={"X-API-Key": "changeme"}
     ).json()["columns"]
-    assert columns == ["ID", "Name"]
+    assert columns == ["id", "name"]
 
     body = {
-        "filters": [{"column": "Name", "op": "eq", "value": "Alice"}],
-        "order_by": {"column": "Name", "direction": "asc"},
-        "fields": ["ID", "Name"],
+        "filters": [{"column": "name", "op": "eq", "value": "Alice"}],
+        "order_by": {"column": "name", "direction": "asc"},
+        "fields": ["id", "name"],
         "limit": 10,
         "offset": 0,
     }
@@ -188,16 +188,16 @@ def test_query_uppercase_and_order_by():
         json=body,
     )
     assert data.status_code == 200
-    assert data.json()["rows"] == [{"ID": 1, "Name": "Alice"}]
+    assert data.json()["rows"] == [{"id": 1, "name": "Alice"}]
     assert data.json()["total"] == 1
 
 
-def test_query_invalid_identifier():
-    content = "id,First Name\n1,Alice\n"
+def test_column_normalization():
+    content = "id,First Name,Last-Name,AGE\n1,Alice,Smith,30\n"
     response = client.post(
         "/upload",
         headers={"X-API-Key": "changeme"},
-        files={"file": ("bad.csv", content, "text/csv")},
+        files={"file": ("norm.csv", content, "text/csv")},
     )
     assert response.status_code == 200
     job_id = response.json()["job_id"]
@@ -207,17 +207,44 @@ def test_query_invalid_identifier():
     columns = client.get(
         f"/tables/{table}/columns", headers={"X-API-Key": "changeme"}
     ).json()["columns"]
-    assert columns == ["id", "First Name"]
+    assert columns == ["id", "first_name", "last_name", "age"]
 
     body = {
+        "filters": [{"column": "first_name", "op": "eq", "value": "Alice"}],
+        "fields": ["first_name", "last_name"],
+        "limit": 10,
+        "offset": 0,
+    }
+    data = client.post(
+        f"/tables/{table}/query",
+        headers={"X-API-Key": "changeme"},
+        json=body,
+    ).json()
+    assert data["rows"] == [{"first_name": "Alice", "last_name": "Smith"}]
+
+    bad_body = {
         "filters": [{"column": "First Name", "op": "eq", "value": "Alice"}],
         "limit": 10,
         "offset": 0,
     }
-    resp = client.post(
+    bad = client.post(
         f"/tables/{table}/query",
         headers={"X-API-Key": "changeme"},
-        json=body,
+        json=bad_body,
     )
-    assert resp.status_code == 400
-    assert "Invalid identifier" in resp.json()["detail"]
+    assert bad.status_code == 400
+    assert "Invalid column" in bad.json()["detail"]
+
+
+def test_column_normalization_duplicate_conflict():
+    content = "First Name,First-Name\nAlice,Ally\n"
+    response = client.post(
+        "/upload",
+        headers={"X-API-Key": "changeme"},
+        files={"file": ("dup.csv", content, "text/csv")},
+    )
+    assert response.status_code == 200
+    job_id = response.json()["job_id"]
+    status = client.get(f"/status/{job_id}", headers={"X-API-Key": "changeme"}).json()
+    assert status["status"] == "failed"
+    assert "already exists" in status["error"].lower()
