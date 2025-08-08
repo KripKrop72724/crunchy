@@ -19,10 +19,18 @@ from fastapi import (
     WebSocket,
 )
 from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 
 from .config import API_KEY, DB_PATH, REDIS_URL, UPLOAD_DIR
 
 app = FastAPI()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 redis_client = redis.Redis.from_url(REDIS_URL, decode_responses=True)
 
 
