@@ -81,7 +81,7 @@ def process_file(job_id: str, file_path: str):
 
         if ext == ".csv":
             conn.execute(
-                f"CREATE TABLE {safe_table} AS SELECT * FROM read_csv_auto('{file_path}', SAMPLE_SIZE=-1)"
+                f"CREATE TABLE {safe_table} AS SELECT * FROM read_csv_auto('{file_path}', SAMPLE_SIZE=-1, HEADER=TRUE, normalize_names=FALSE)"
             )
         elif ext == ".parquet":
             conn.execute(
@@ -89,6 +89,13 @@ def process_file(job_id: str, file_path: str):
             )
         else:
             raise ValueError("Unsupported file type")
+
+        for col in conn.execute(f"PRAGMA table_info({safe_table})").fetchall():
+            clean = col[1].lower().replace(" ", "_").replace("-", "_")
+            orig = col[1].replace('"', '""')
+            conn.execute(
+                f'ALTER TABLE {safe_table} RENAME COLUMN "{orig}" TO "{clean}"'
+            )
 
         rows = conn.execute(f"SELECT COUNT(*) FROM {safe_table}").fetchone()[0]
         redis_client.hset(job_key, "rows", rows)
@@ -131,7 +138,7 @@ def _run_query_cached(table_name: str, req_json: str):
 
 
 def _run_query(table_name: str, req: QueryRequest):
-    conn = duckdb.connect(DB_PATH)
+    conn = duckdb.connect(database=DB_PATH, read_only=True)
     tables = [r[0] for r in conn.execute("SHOW TABLES").fetchall()]
     if table_name not in tables:
         conn.close()
@@ -273,7 +280,7 @@ def status(job_id: str, _: None = Depends(verify_api_key)):
 @app.get("/tables")
 async def list_tables(_: None = Depends(verify_api_key)):
     def _list():
-        conn = duckdb.connect(DB_PATH)
+        conn = duckdb.connect(database=DB_PATH, read_only=True)
         tables = [r[0] for r in conn.execute("SHOW TABLES").fetchall()]
         conn.close()
         return tables
@@ -285,7 +292,7 @@ async def list_tables(_: None = Depends(verify_api_key)):
 @app.get("/tables/{table_name}/columns")
 async def table_columns(table_name: str, _: None = Depends(verify_api_key)):
     def _cols():
-        conn = duckdb.connect(DB_PATH)
+        conn = duckdb.connect(database=DB_PATH, read_only=True)
         try:
             safe_table = quote_ident(table_name)
             rows = conn.execute(f"PRAGMA table_info({safe_table})").fetchall()
