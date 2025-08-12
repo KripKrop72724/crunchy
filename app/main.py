@@ -1,18 +1,19 @@
+# app/main.py
 import uuid
 from pathlib import Path
 import asyncio
 import json
 import hashlib
 import re
+from typing import Any, Dict, List, Optional
+from datetime import date, datetime
 
 import aiofiles
 import duckdb
 import redis
 from redis.exceptions import RedisError
 from rq import Queue
-from typing import Any, List, Literal, Optional, Union
-from datetime import date, datetime
-from pydantic import BaseModel, conint, field_validator
+from pydantic import BaseModel, conint
 from fastapi import (
     Depends,
     FastAPI,
@@ -26,8 +27,12 @@ from fastapi import (
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 
+# ---- project config (ENV → objects) -----------------------------------------
 from .config import API_KEY, DB_PATH, REDIS_URL, UPLOAD_DIR
 
+# -----------------------------------------------------------------------------
+# App & infra
+# -----------------------------------------------------------------------------
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
@@ -38,283 +43,336 @@ app.add_middleware(
 )
 redis_client = redis.Redis.from_url(REDIS_URL, decode_responses=True)
 queue = Queue(connection=redis_client)
+
+# cache time for /query responses
 QUERY_CACHE_TTL = 60
+# ingestion batch size
+BATCH_SIZE = 100_000
 
-
-# Regular expression for validating SQL identifiers
-IDENT_REGEX = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*$')
-
+# -----------------------------------------------------------------------------
+# SQL identifier safety & helpers
+# -----------------------------------------------------------------------------
+IDENT_REGEX = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+INTERNAL_COLS = {"row_hash", "__source_file", "__ingested_at"}
 
 def quote_ident(name: str) -> str:
-    """Validate and quote an SQL identifier."""
+    """Strict: validate and quote a *cleaned/trusted* SQL identifier."""
     if not IDENT_REGEX.match(name):
         raise HTTPException(400, f"Invalid identifier: {name!r}")
     return f'"{name}"'
 
+def quote_any_ident(name: str) -> str:
+    """Loose: safely quote *any* identifier (raw CSV header, may have spaces, symbols)."""
+    return '"' + str(name).replace('"', '""') + '"'
+
+def record_file(con: duckdb.DuckDBPyConnection, job_id: str, filename: str, file_hash: str) -> None:
+    # Insert only if (filename, file_hash) is new. This avoids choosing a conflict target
+    # and works on all DuckDB versions without ON CONFLICT support.
+    con.execute(
+        """
+        INSERT INTO files(file_id, filename, file_hash)
+        SELECT ?, ?, ?
+        WHERE NOT EXISTS (
+            SELECT 1 FROM files WHERE filename = ? AND file_hash = ?
+        );
+        """,
+        (job_id, filename, file_hash, filename, file_hash),
+    )
+
+
+def clean_col(name: str) -> str:
+    # lower → replace spaces/dashes with _ → drop non [A-Za-z0-9_]
+    n = name.strip().lower().replace(" ", "_").replace("-", "_")
+    n = re.sub(r"[^a-z0-9_]", "", n)
+    if not n or n[0].isdigit():
+        n = f"col_{n}" if n else "col"
+    return n
 
 def _json_default(obj: Any):
     if isinstance(obj, (date, datetime)):
         return obj.isoformat()
     raise TypeError
 
+# richer job status helpers
+def status_set(job_id: str, **kw):
+    job_key = f"job:{job_id}"
+    mapping = {}
+    for k, v in kw.items():
+        if isinstance(v, str):
+            mapping[k] = v
+        elif isinstance(v, (dict, list)):
+            mapping[k] = json.dumps(v)
+        else:
+            mapping[k] = str(v)
+    redis_client.hset(job_key, mapping=mapping)
 
-# ---------------------------------------------------------------------------
-# Utility & startup
-# ---------------------------------------------------------------------------
+def status_get(job_id: str) -> dict:
+    job_key = f"job:{job_id}"
+    data = redis_client.hgetall(job_key)
+    if not data:
+        return {}
+    def to_int(x):
+        try:
+            return int(x)
+        except:
+            return 0
+    def to_float(x):
+        try:
+            return float(x)
+        except:
+            return 0.0
+    out = {
+        "status": data.get("status"),
+        "stage": data.get("stage"),
+        "uploaded": to_int(data.get("uploaded")),
+        "total": to_int(data.get("total")) or None,
+        "rows_total": to_int(data.get("rows_total")),
+        "rows_processed": to_int(data.get("rows_processed")),
+        "rows_inserted": to_int(data.get("rows_inserted")),
+        "rows_skipped": to_int(data.get("rows_skipped")),
+        "progress": to_float(data.get("progress")),
+        "error": data.get("error") or None,
+        "file": data.get("file") or None,
+        "started_at": data.get("started_at"),
+        "ended_at": data.get("ended_at"),
+    }
+    return out
 
+# -----------------------------------------------------------------------------
+# Auth
+# -----------------------------------------------------------------------------
 def verify_api_key(x_api_key: str = Header(None)):
     if API_KEY and x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API Key")
 
-
+# -----------------------------------------------------------------------------
+# Startup: ensure dirs & base tables (and migrate row_hash → UBIGINT)
+# -----------------------------------------------------------------------------
 @app.on_event("startup")
 def startup_event():
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-    # Ensure the database file exists
-    conn = duckdb.connect(DB_PATH)
-    conn.close()
+    with duckdb.connect(DB_PATH, read_only=False) as con:
+        # Create tables if missing (fresh DBs get UBIGINT immediately)
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS dataset (
+                row_hash      UBIGINT,
+                __source_file VARCHAR,
+                __ingested_at TIMESTAMP
+            );
+        """)
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS files (
+                file_id     VARCHAR PRIMARY KEY,
+                filename    VARCHAR,
+                file_hash   VARCHAR,
+                uploaded_at TIMESTAMP DEFAULT NOW(),
+                UNIQUE(filename, file_hash)
+            );
+        """)
 
+        # Check current type of row_hash
+        info = con.execute("PRAGMA table_info('dataset')").fetchall()
+        types = {r[1]: (r[2] or "").upper() for r in info}  # col_name -> TYPE
 
-# ---------------------------------------------------------------------------
-# Background processing
-# ---------------------------------------------------------------------------
+        # If legacy BIGINT, migrate to UBIGINT:
+        if types.get("row_hash", "") != "UBIGINT":
+            # 1) Drop the index that depends on the column type (if it exists)
+            con.execute("DROP INDEX IF EXISTS idx_dataset_rowhash;")
+            # 2) Alter the column type (support both syntaxes across DuckDB versions)
+            try:
+                con.execute("ALTER TABLE dataset ALTER COLUMN row_hash TYPE UBIGINT;")
+            except duckdb.Error:
+                con.execute("ALTER TABLE dataset ALTER COLUMN row_hash SET DATA TYPE UBIGINT;")
 
-def process_file(job_id: str, file_path: str):
-    job_key = f"job:{job_id}"
-    redis_client.hset(job_key, mapping={"status": "processing", "rows": 0})
-    try:
-        table = f"import_{job_id.replace('-', '_')}"
-        safe_table = quote_ident(table)
-        conn = duckdb.connect(DB_PATH)
-        ext = Path(file_path).suffix.lower()
+        # 3) Ensure unique index is present (idempotent)
+        con.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_dataset_rowhash ON dataset(row_hash);")
 
-        if ext == ".csv":
-            conn.execute(
-                f"CREATE TABLE {safe_table} AS SELECT * FROM read_csv_auto('{file_path}', SAMPLE_SIZE=-1, HEADER=TRUE, normalize_names=FALSE)"
-            )
-        elif ext == ".parquet":
-            conn.execute(
-                f"CREATE TABLE {safe_table} AS SELECT * FROM parquet_scan('{file_path}')"
-            )
-        else:
-            raise ValueError("Unsupported file type")
-
-        for col in conn.execute(f"PRAGMA table_info({safe_table})").fetchall():
-            clean = col[1].lower().replace(" ", "_").replace("-", "_")
-            orig = col[1].replace('"', '""')
-            conn.execute(
-                f'ALTER TABLE {safe_table} RENAME COLUMN "{orig}" TO "{clean}"'
-            )
-
-        rows = conn.execute(f"SELECT COUNT(*) FROM {safe_table}").fetchone()[0]
-        redis_client.hset(job_key, "rows", rows)
-        conn.close()
-        redis_client.hset(job_key, mapping={"status": "completed", "table": table})
-    except Exception as e:  # pragma: no cover - error path
-        redis_client.hset(job_key, mapping={"status": "failed", "error": str(e)})
-
-
-# ---------------------------------------------------------------------------
-# API endpoints
-# ---------------------------------------------------------------------------
-
-
-class Filter(BaseModel):
-    column: str
-    op: Literal[
-        "eq",
-        "neq",
-        "lt",
-        "lte",
-        "gt",
-        "gte",
-        "like",
-        "ilike",
-        "ieq",
-        "in",
-        "between",
-        "in_range",
-        "is_null",
-        "is_not_null",
-    ]
-    value: Any = None
-
-
-class LogicGroup(BaseModel):
-    logic: List[Union[str, "LogicGroup", Filter]]
-
-    @field_validator("logic")
-    def check_logic(cls, v):  # pragma: no cover - validation
-        if not v or not isinstance(v[0], str) or v[0] not in {"AND", "OR"}:
-            raise ValueError("logic must start with 'AND' or 'OR'")
-        if len(v) < 2:
-            raise ValueError("logic must contain at least one condition")
-        return v
-
-
-LogicGroup.model_rebuild()
-
-
-class OrderBy(BaseModel):
-    column: str
-    direction: Literal["asc", "desc"] = "asc"
-
-
-class QueryRequest(BaseModel):
-    filters: List[Filter] = []
-    logical_operator: Literal["AND", "OR"] = "AND"
-    logic: Optional[LogicGroup] = None
-    order_by: Optional[OrderBy] = None
+# -----------------------------------------------------------------------------
+# Pydantic models (simple pre-available filters)
+# -----------------------------------------------------------------------------
+class SimpleQueryRequest(BaseModel):
+    filters: Dict[str, List[str]] = {}
+    fields: Optional[List[str]] = None
     limit: conint(gt=0) = 100
     offset: conint(ge=0) = 0
-    fields: Optional[List[str]] = None
 
-    @field_validator("logic", mode="before")
-    def wrap_logic(cls, v):  # pragma: no cover - validation
-        if isinstance(v, list):
-            return {"logic": v}
-        return v
+class DistinctQuery(BaseModel):
+    q: Optional[str] = None
+    limit: conint(gt=0) = 200
 
+# -----------------------------------------------------------------------------
+# Helpers for DB access
+# -----------------------------------------------------------------------------
+def list_user_columns(con: duckdb.DuckDBPyConnection) -> List[str]:
+    rows = con.execute("PRAGMA table_info(dataset)").fetchall()
+    cols = [r[1] for r in rows if r[1] not in INTERNAL_COLS]
+    return cols
 
-def _prepare_query(table_name: str, req: QueryRequest):
-    conn = duckdb.connect(database=DB_PATH, read_only=True)
-    tables = [r[0] for r in conn.execute("SHOW TABLES").fetchall()]
-    if table_name not in tables:
-        conn.close()
-        raise HTTPException(404, "Unknown table")
+def ensure_columns(con: duckdb.DuckDBPyConnection, cols: List[str]) -> None:
+    # Add missing user columns to dataset (all VARCHAR)
+    current = set(list_user_columns(con))
+    for c in cols:
+        if c not in current:
+            con.execute(f'ALTER TABLE dataset ADD COLUMN {quote_ident(c)} VARCHAR;')
 
-    safe_table = quote_ident(table_name)
-
-    rows_info = conn.execute(f"PRAGMA table_info({safe_table})").fetchall()
-    columns = [r[1] for r in rows_info]
-    if req.order_by and req.order_by.column not in columns:
-        conn.close()
-        raise HTTPException(400, f"Invalid column: {req.order_by.column}")
-    if req.fields:
-        for col in req.fields:
-            if col not in columns:
-                conn.close()
-                raise HTTPException(400, f"Invalid column: {col}")
-        select_cols = ", ".join(quote_ident(c) for c in req.fields)
+def compute_hash_expression(cols: List[str], prefix: str = "") -> str:
+    """Return UBIGINT hash expression over cols (optionally prefixed)."""
+    if prefix:
+        items = ", ".join(f"coalesce({prefix}.{quote_ident(c)}, '')" for c in cols)
     else:
-        select_cols = "*"
+        items = ", ".join(f"coalesce({quote_ident(c)}, '')" for c in cols)
+    return f"CAST(hash({items}) AS UBIGINT)"
 
-    col_types = {r[1]: r[2] for r in rows_info}
+# -----------------------------------------------------------------------------
+# Background ingestion job (batched + progress)
+# -----------------------------------------------------------------------------
+def process_file(job_id: str, file_path: str, file_hash: str, orig_filename: str):
+    rkey = f"job:{job_id}"
+    status_set(job_id, status="processing", stage="reading", progress=0.0)
 
-    def parse_value(column: str, value: Any) -> Any:
-        col_type = col_types.get(column, "").upper()
-        if isinstance(value, str) and col_type in {"DATE", "TIMESTAMP"}:
-            try:
-                if col_type == "DATE":
-                    return date.fromisoformat(value)
-                else:
-                    return datetime.fromisoformat(value)
-            except Exception:
-                conn.close()
-                raise HTTPException(400, f"Invalid date: {value}")
-        return value
+    try:
+        staging = f"staging_{job_id.replace('-', '_')}"
+        safe_staging = quote_ident(staging)
 
-    def build_filter(flt: Filter):
-        if flt.column not in columns:
-            conn.close()
-            raise HTTPException(400, f"Invalid column: {flt.column}")
-        col = quote_ident(flt.column)
-        if flt.op == "in":
-            if not isinstance(flt.value, list) or not flt.value:
-                conn.close()
-                raise HTTPException(400, "List value required")
-            vals = [parse_value(flt.column, v) for v in flt.value]
-            placeholders = ", ".join("?" for _ in vals)
-            return f"{col} IN ({placeholders})", vals
-        elif flt.op == "between":
-            if not isinstance(flt.value, list) or len(flt.value) != 2:
-                conn.close()
-                raise HTTPException(400, "Two values required")
-            vals = [parse_value(flt.column, v) for v in flt.value]
-            return f"{col} BETWEEN ? AND ?", vals
-        elif flt.op == "in_range":
-            if not isinstance(flt.value, list) or not flt.value:
-                conn.close()
-                raise HTTPException(400, "List value required")
-            vals = [parse_value(flt.column, v) for v in flt.value]
-            lo, hi = min(vals), max(vals)
-            return f"{col} BETWEEN ? AND ?", [lo, hi]
-        elif flt.op == "is_null":
-            return f"{col} IS NULL", []
-        elif flt.op == "is_not_null":
-            return f"{col} IS NOT NULL", []
-        elif flt.op == "ilike":
-            v = flt.value if isinstance(flt.value, str) else str(flt.value)
-            return f"{col} ILIKE ?", [f"%{v}%"]
-        elif flt.op == "ieq":
-            v = flt.value if isinstance(flt.value, str) else str(flt.value)
-            return f"LOWER({col}) = LOWER(?)", [v]
-        else:
-            op_sql = {
-                "eq": "=",
-                "neq": "<>",
-                "lt": "<",
-                "lte": "<=",
-                "gt": ">",
-                "gte": ">=",
-                "like": "LIKE",
-            }[flt.op]
-            value = parse_value(flt.column, flt.value)
-            if flt.op == "like":
-                value = f"%{value}%"
-            return f"{col} {op_sql} ?", [value]
+        with duckdb.connect(DB_PATH, read_only=False) as con:
+            # double-check file-level dedup
+            exists = con.execute(
+                "SELECT 1 FROM files WHERE filename=? AND file_hash=? LIMIT 1",
+                (orig_filename, file_hash)
+            ).fetchone()
+            if exists:
+                status_set(job_id, status="completed", stage="completed", ended_at=datetime.utcnow().isoformat())
+                return
 
-    def build_logic(group: LogicGroup):
-        items = group.logic
-        op = items[0]
-        clauses = []
-        params: List[Any] = []
-        for item in items[1:]:
-            if isinstance(item, LogicGroup):
-                c, p = build_logic(item)
-            elif isinstance(item, Filter):
-                c, p = build_filter(item)
+            ext = Path(file_path).suffix.lower()
+            if ext == ".csv":
+                con.execute(f"""
+                    CREATE OR REPLACE TABLE {safe_staging} AS
+                    SELECT * FROM read_csv_auto('{file_path}', SAMPLE_SIZE=-1, HEADER=TRUE, normalize_names=FALSE);
+                """)
+            elif ext == ".parquet":
+                con.execute(f"""
+                    CREATE OR REPLACE TABLE {safe_staging} AS
+                    SELECT * FROM parquet_scan('{file_path}');
+                """)
             else:
-                conn.close()
-                raise HTTPException(400, "Invalid logic element")
-            clauses.append(c)
-            params.extend(p)
-        return "(" + f" {op} ".join(clauses) + ")", params
+                raise ValueError("Unsupported file type (csv or parquet only)")
 
-    logic_obj = req.logic
-    if logic_obj is None and req.filters:
-        logic_obj = LogicGroup(logic=[req.logical_operator, *req.filters])
+            # normalize columns (rename raw headers → cleaned names)
+            status_set(job_id, stage="schema_evolved")
+            info = con.execute(f"PRAGMA table_info({safe_staging})").fetchall()
+            orig_cols = [r[1] for r in info]
+            mapping = {c: clean_col(c) for c in orig_cols}
 
-    where_sql = ""
-    params: List[Any] = []
-    if logic_obj:
-        clause, params = build_logic(logic_obj)
-        where_sql = "WHERE " + clause
+            # ensure uniqueness after cleaning (append _1, _2 … if needed)
+            seen = set()
+            for k, v in list(mapping.items()):
+                base, i = v, 1
+                while mapping[k] in seen:
+                    mapping[k] = f"{base}_{i}"
+                    i += 1
+                seen.add(mapping[k])
 
-    order_sql = ""
-    if req.order_by:
-        col = quote_ident(req.order_by.column)
-        order_sql = f"ORDER BY {col} {req.order_by.direction.upper()}"
+            # RENAME using *loose* quoting for original headers, strict for cleaned
+            for orig, new in mapping.items():
+                if orig != new:
+                    con.execute(
+                        f'ALTER TABLE {safe_staging} RENAME COLUMN {quote_any_ident(orig)} TO {quote_ident(new)};'
+                    )
 
-    data_sql = (
-        f"SELECT {select_cols} FROM {safe_table} {where_sql} {order_sql} LIMIT ? OFFSET ?"
-    )
-    data_params = params + [req.limit, req.offset]
-    count_sql = f"SELECT COUNT(*) FROM {safe_table} {where_sql}"
-    return conn, data_sql, data_params, count_sql, params
+            new_cols = list(mapping.values())
+            # ensure columns exist in dataset
+            ensure_columns(con, new_cols)
 
+            # union of user columns in dataset AFTER evolution
+            all_user_cols = list_user_columns(con)
+            all_user_cols.sort()
 
-def _run_query(table_name: str, req: QueryRequest):
-    conn, data_sql, data_params, count_sql, params = _prepare_query(table_name, req)
-    cursor = conn.execute(data_sql, data_params)
-    rows = cursor.fetchall()
-    col_names = [d[0] for d in cursor.description]
-    total = conn.execute(count_sql, params).fetchone()[0]
-    conn.close()
+            # count rows to drive progress
+            status_set(job_id, stage="counting")
+            rows_total = con.execute(f"SELECT COUNT(*) FROM {safe_staging}").fetchone()[0]
+            redis_client.hset(rkey, "rows_total", rows_total)
 
-    result_rows = [dict(zip(col_names, row)) for row in rows]
-    return result_rows, total
+            if rows_total == 0:
+                record_file(con, job_id, orig_filename, file_hash)
+                status_set(job_id, status="completed", stage="completed", progress=1.0, ended_at=datetime.utcnow().isoformat())
+                con.execute(f"DROP TABLE IF EXISTS {safe_staging}")
+                return
 
+            # add a stable row_number for batching
+            con.execute(f'CREATE TEMP TABLE {staging}_rn AS SELECT *, row_number() OVER () AS __rn FROM {safe_staging};')
+
+            # build per-column expressions for projection and hashing w/ alias s
+            proj_parts = []
+            hash_parts = []
+            for c in all_user_cols:
+                if c in new_cols:
+                    proj_parts.append(f'CAST(s.{quote_ident(c)} AS VARCHAR) AS {quote_ident(c)}')
+                    hash_parts.append(f"coalesce(CAST(s.{quote_ident(c)} AS VARCHAR), '')")
+                else:
+                    proj_parts.append(f'CAST(NULL AS VARCHAR) AS {quote_ident(c)}')
+                    hash_parts.append("''")
+            projection = ", ".join(proj_parts)
+            # >>> ensure UBIGINT hash to match column type
+            row_hash_expr = f"CAST(hash({', '.join(hash_parts)}) AS UBIGINT)"
+
+            rows_processed = 0
+            rows_inserted = 0
+            rows_skipped = 0
+
+            status_set(job_id, stage="ingesting", rows_processed=0, rows_inserted=0, rows_skipped=0)
+            while rows_processed < rows_total:
+                lo = rows_processed + 1
+                hi = min(rows_processed + BATCH_SIZE, rows_total)
+
+                before_cnt = con.execute("SELECT COUNT(*) FROM dataset").fetchone()[0]
+
+                user_cols_csv = ", ".join(quote_ident(c) for c in all_user_cols)
+                target_cols_csv = f"{user_cols_csv}, row_hash, __source_file, __ingested_at"
+
+                # Insert unique rows for this batch using anti-join on row_hash
+                con.execute(f"""
+                    INSERT INTO dataset ({target_cols_csv})
+                    SELECT {projection},
+                           {row_hash_expr} AS row_hash,
+                           ? AS __source_file,
+                           NOW() AS __ingested_at
+                    FROM {staging}_rn s
+                    WHERE s.__rn BETWEEN ? AND ?
+                      AND NOT EXISTS (
+                          SELECT 1 FROM dataset d WHERE d.row_hash = {row_hash_expr}
+                      );
+                """, [orig_filename, lo, hi])
+
+                after_cnt = con.execute("SELECT COUNT(*) FROM dataset").fetchone()[0]
+                inserted = max(0, after_cnt - before_cnt)
+
+                rows_processed = hi
+                rows_inserted += inserted
+                rows_skipped = rows_processed - rows_inserted
+
+                progress = rows_processed / rows_total if rows_total else 1.0
+                status_set(
+                    job_id,
+                    rows_processed=rows_processed,
+                    rows_inserted=rows_inserted,
+                    rows_skipped=rows_skipped,
+                    progress=progress
+                )
+
+            # record file & cleanup
+            record_file(con, job_id, orig_filename, file_hash)
+            con.execute(f"DROP TABLE IF EXISTS {safe_staging}")
+            con.execute(f"DROP TABLE IF EXISTS {staging}_rn")
+
+            status_set(job_id, status="completed", stage="completed", progress=1.0, ended_at=datetime.utcnow().isoformat())
+
+    except Exception as e:
+        status_set(job_id, status="failed", stage="failed", error=str(e), ended_at=datetime.utcnow().isoformat())
+
+# -----------------------------------------------------------------------------
+# Upload / Status
+# -----------------------------------------------------------------------------
 @app.post("/upload")
 async def upload(
     request: Request,
@@ -322,162 +380,309 @@ async def upload(
     _: None = Depends(verify_api_key),
 ):
     job_id = str(uuid.uuid4())
-    filename = f"{job_id}_{file.filename}"
-    dest_path = UPLOAD_DIR / filename
+    dest_path = UPLOAD_DIR / f"{job_id}_{file.filename}"
 
     total = request.headers.get("content-length")
     total = int(total) if total and total.isdigit() else 0
 
-    job_key = f"job:{job_id}"
-    redis_client.hset(job_key, mapping={
-        "status": "uploading",
-        "uploaded": 0,
-        "total": total,
-        "rows": 0,
-        "table": "",
-        "error": "",
-    })
+    status_set(
+        job_id,
+        status="uploading",
+        stage="uploading",
+        uploaded=0,
+        total=total,
+        rows_total=0,
+        rows_processed=0,
+        rows_inserted=0,
+        rows_skipped=0,
+        progress=0.0,
+        error="",
+        file=file.filename,
+        started_at=datetime.utcnow().isoformat(),
+        ended_at="",
+    )
 
+    # stream save and sha256 on the fly
+    hasher = hashlib.sha256()
     try:
         async with aiofiles.open(dest_path, "wb") as out:
             while chunk := await file.read(1024 * 1024):
+                hasher.update(chunk)
                 await out.write(chunk)
-                redis_client.hincrby(job_key, "uploaded", len(chunk))
-    except Exception as e:  # pragma: no cover - error path
-        redis_client.hset(job_key, mapping={"status": "failed", "error": f"Upload error: {e}"})
+                redis_client.hincrby(f"job:{job_id}", "uploaded", len(chunk))
+                if total:
+                    uploaded = int(redis_client.hget(f"job:{job_id}", "uploaded") or 0)
+                    prog = min(1.0, uploaded / total)
+                    status_set(job_id, progress=prog)
+    except Exception as e:
+        status_set(job_id, status="failed", stage="uploading", error=f"Upload error: {e}", ended_at=datetime.utcnow().isoformat())
         raise HTTPException(500, "Failed to upload file.")
 
-    redis_client.hset(job_key, mapping={"status": "queued"})
-    queue.enqueue(process_file, job_id, str(dest_path))
-    return {"job_id": job_id}
+    file_hash = hasher.hexdigest()
 
+    # File-level dedup check
+    with duckdb.connect(DB_PATH, read_only=True) as con:
+        exists = con.execute(
+            "SELECT 1 FROM files WHERE filename=? AND file_hash=? LIMIT 1",
+            (file.filename, file_hash)
+        ).fetchone()
+    if exists:
+        status_set(job_id, status="completed", stage="completed", progress=1.0, ended_at=datetime.utcnow().isoformat())
+        return {"job_id": job_id, "skipped": True}
+
+    # queue ingestion
+    status_set(job_id, status="queued", stage="queued")
+    queue.enqueue(process_file, job_id, str(dest_path), file_hash, file.filename)
+    return {"job_id": job_id}
 
 @app.get("/status/{job_id}")
 def status(job_id: str, _: None = Depends(verify_api_key)):
-    job_key = f"job:{job_id}"
-    data = redis_client.hgetall(job_key)
-    if not data:
+    data = status_get(job_id)
+    if not data.get("status"):
         raise HTTPException(404, "Unknown job_id")
-    # Convert numeric fields
-    response = {
-        "status": data.get("status"),
-        "uploaded": int(data.get("uploaded", 0)),
-        "total": int(data.get("total", 0)) or None,
-        "rows": int(data.get("rows", 0)),
-        "table": data.get("table") or None,
-        "error": data.get("error") or None,
-    }
-    return JSONResponse(response)
+    return JSONResponse(data)
 
+# Optional SSE stream of status (handy if you don't want websockets)
+@app.get("/status/stream/{job_id}")
+async def status_stream(job_id: str, _: None = Depends(verify_api_key)):
+    async def gen():
+        prev = None
+        while True:
+            data = status_get(job_id)
+            if not data.get("status"):
+                yield "event: error\ndata: {\"error\":\"unknown job\"}\n\n"
+                break
+            if data != prev:
+                payload = json.dumps(data)
+                yield f"data: {payload}\n\n"
+                prev = dict(data)
+                if data.get("status") in {"completed", "failed"}:
+                    break
+            await asyncio.sleep(1)
+    return StreamingResponse(gen(), media_type="text/event-stream")
 
-@app.get("/tables")
-async def list_tables(_: None = Depends(verify_api_key)):
-    def _list():
-        conn = duckdb.connect(database=DB_PATH, read_only=True)
-        tables = [r[0] for r in conn.execute("SHOW TABLES").fetchall()]
-        conn.close()
-        return tables
+# -----------------------------------------------------------------------------
+# Columns & distinct values (for dropdowns)
+# -----------------------------------------------------------------------------
+@app.get("/columns")
+def columns(_: None = Depends(verify_api_key)):
+    with duckdb.connect(DB_PATH, read_only=True) as con:
+        cols = list_user_columns(con)
+    return {"columns": cols}
 
-    tables = await asyncio.to_thread(_list)
-    return {"tables": tables}
-
-
-@app.get("/tables/{table_name}/columns")
-async def table_columns(table_name: str, _: None = Depends(verify_api_key)):
-    def _cols():
-        conn = duckdb.connect(database=DB_PATH, read_only=True)
-        try:
-            safe_table = quote_ident(table_name)
-            rows = conn.execute(f"PRAGMA table_info({safe_table})").fetchall()
-        except HTTPException:
-            conn.close()
-            raise
-        except Exception:
-            conn.close()
-            raise HTTPException(404, "Unknown table")
-        if not rows:
-            conn.close()
-            raise HTTPException(404, "Unknown table")
-        columns = [r[1] for r in rows]
-        conn.close()
-        return columns
-
-    columns = await asyncio.to_thread(_cols)
-    return {"columns": columns}
-
-
-@app.post("/tables/{table_name}/query")
-async def query_table(
-    table_name: str, req: QueryRequest, _: None = Depends(verify_api_key)
+@app.get("/distinct/{column}")
+def distinct_values(
+    column: str,
+    q: Optional[str] = None,
+    limit: conint(gt=0) = 200,
+    _: None = Depends(verify_api_key),
 ):
-    req_json = json.dumps(req.dict(), sort_keys=True)
-    key = hashlib.sha256((req_json + table_name).encode()).hexdigest()
-    cached = None
+    if column in INTERNAL_COLS:
+        raise HTTPException(400, "Invalid column")
+    col = quote_ident(column)  # strict: expect cleaned names on the API
+    params: List[Any] = []
+    where_sql = f"WHERE {col} IS NOT NULL"
+    if q:
+        where_sql = f"WHERE {col} IS NOT NULL AND {col} ILIKE ?"
+        params.append(f"%{q}%")
+    with duckdb.connect(DB_PATH, read_only=True) as con:
+        rows = con.execute(
+            f"SELECT DISTINCT {col} AS v FROM dataset {where_sql} ORDER BY v LIMIT ?",
+            (*params, limit),
+        ).fetchall()
+    return {"values": [r[0] for r in rows]}
+
+# -----------------------------------------------------------------------------
+# Simple AND filters query
+# -----------------------------------------------------------------------------
+class SimpleQueryRequest(BaseModel):
+    filters: Dict[str, List[str]] = {}
+    fields: Optional[List[str]] = None
+    limit: conint(gt=0) = 100
+    offset: conint(ge=0) = 0
+
+@app.post("/query")
+def simple_query(body: SimpleQueryRequest, _: None = Depends(verify_api_key)):
+    # Normalize empty fields list → None (treat as “all user columns”)
+    if body.fields is not None and len(body.fields) == 0:
+        body.fields = None
+
+    # cache
+    cache_key = hashlib.sha256(json.dumps(body.dict(), sort_keys=True).encode()).hexdigest()
     try:
-        cached = redis_client.get(key)
+        cached = redis_client.get(cache_key)
     except RedisError:
-        pass
+        cached = None
     if cached:
         return json.loads(cached)
-    rows, total = await asyncio.to_thread(_run_query, table_name, req)
-    result = {"rows": rows, "total": total}
+
+    with duckdb.connect(DB_PATH, read_only=True) as con:
+        user_cols_list = list_user_columns(con)
+        user_cols = set(user_cols_list)
+
+        # If there are no user columns at all (fresh DB), return empty result gracefully
+        if not user_cols_list:
+            result = {"rows": [], "total": 0}
+            try:
+                redis_client.setex(cache_key, QUERY_CACHE_TTL, json.dumps(result))
+            except RedisError:
+                pass
+            return result
+
+        # projection
+        if body.fields:
+            for c in body.fields:
+                if c not in user_cols:
+                    raise HTTPException(400, f"Unknown column: {c}")
+            fields = body.fields
+        else:
+            fields = sorted(user_cols_list)
+
+        # Defensive: if fields resolved to empty (shouldn't happen), return empty result
+        if not fields:
+            result = {"rows": [], "total": 0}
+            try:
+                redis_client.setex(cache_key, QUERY_CACHE_TTL, json.dumps(result))
+            except RedisError:
+                pass
+            return result
+
+        select_cols = ", ".join(quote_ident(c) for c in fields)
+
+        # WHERE col IN (...) AND col2 IN (...)
+        where_clauses = []
+        params: List[Any] = []
+        for c, vals in body.filters.items():
+            if c not in user_cols:
+                raise HTTPException(400, f"Unknown column: {c}")
+            if not vals:
+                continue
+            placeholders = ", ".join("?" for _ in vals)
+            where_clauses.append(f"{quote_ident(c)} IN ({placeholders})")
+            params.extend(vals)
+        where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
+
+        data_sql = f"""
+            SELECT {select_cols}
+              FROM dataset
+              {where_sql}
+             LIMIT ? OFFSET ?;
+        """
+        params.extend([body.limit, body.offset])
+
+        cursor = con.execute(data_sql, params)
+        rows = cursor.fetchall()
+        col_names = [d[0] for d in cursor.description]
+
+        # Total for pagination (same filters)
+        count_sql = f"SELECT COUNT(*) FROM dataset {where_sql}"
+        total = con.execute(count_sql, params[:-2]).fetchone()[0]
+
+    result = {"rows": [dict(zip(col_names, r)) for r in rows], "total": total}
     try:
-        redis_client.setex(key, QUERY_CACHE_TTL, json.dumps(result))
+        redis_client.setex(cache_key, QUERY_CACHE_TTL, json.dumps(result))
     except RedisError:
         pass
     return result
 
+# -----------------------------------------------------------------------------
+# Streaming (optional)
+# -----------------------------------------------------------------------------
+@app.post("/stream")
+def stream_query(body: SimpleQueryRequest, _: None = Depends(verify_api_key)):
+    # Normalize empty fields list → None
+    if body.fields is not None and len(body.fields) == 0:
+        body.fields = None
 
-@app.post("/tables/{table_name}/stream")
-async def stream_table(
-    table_name: str, req: QueryRequest, _: None = Depends(verify_api_key)
-):
-    conn, data_sql, data_params, _, _ = _prepare_query(table_name, req)
+    with duckdb.connect(DB_PATH, read_only=True) as con:
+        user_cols_list = list_user_columns(con)
+        user_cols = set(user_cols_list)
 
-    def generator():
-        cursor = conn.execute(data_sql, data_params)
-        cols = [d[0] for d in cursor.description]
-        try:
-            while True:
-                row = cursor.fetchone()
-                if row is None:
-                    break
-                yield json.dumps(dict(zip(cols, row)), default=_json_default) + "\n"
-        finally:
-            conn.close()
+        # No user columns → return an empty stream immediately
+        if not user_cols_list:
+            def empty():
+                if False:
+                    yield ""
+                return
+            return StreamingResponse(empty(), media_type="application/x-ndjson")
 
-    return StreamingResponse(generator(), media_type="application/x-ndjson")
+        if body.fields:
+            for c in body.fields:
+                if c not in user_cols:
+                    raise HTTPException(400, f"Unknown column: {c}")
+            fields = body.fields
+        else:
+            fields = sorted(user_cols_list)
 
+        if not fields:
+            def empty():
+                if False:
+                    yield ""
+                return
+            return StreamingResponse(empty(), media_type="application/x-ndjson")
 
+        select_cols = ", ".join(quote_ident(c) for c in fields)
+
+        where_clauses = []
+        params: List[Any] = []
+        for c, vals in body.filters.items():
+            if c not in user_cols:
+                raise HTTPException(400, f"Unknown column: {c}")
+            if not vals:
+                continue
+            placeholders = ", ".join("?" for _ in vals)
+            where_clauses.append(f"{quote_ident(c)} IN ({placeholders})")
+            params.extend(vals)
+        where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
+
+        data_sql = f"SELECT {select_cols} FROM dataset {where_sql};"
+
+    def gen():
+        with duckdb.connect(DB_PATH, read_only=True) as con2:
+            cur = con2.execute(data_sql, params)
+            names = [d[0] for d in cur.description]
+            try:
+                while True:
+                    row = cur.fetchone()
+                    if row is None:
+                        break
+                    yield json.dumps(dict(zip(names, row)), default=_json_default) + "\n"
+            finally:
+                pass
+
+    return StreamingResponse(gen(), media_type="application/x-ndjson")
+
+# -----------------------------------------------------------------------------
+# Live job status (WebSocket)
+# -----------------------------------------------------------------------------
 @app.websocket("/ws/status/{job_id}")
 async def ws_status(websocket: WebSocket, job_id: str):
     await websocket.accept()
-    job_key = f"job:{job_id}"
     prev = None
     try:
         while True:
-            data = redis_client.hgetall(job_key)
-            if not data:
+            data = status_get(job_id)
+            if not data.get("status"):
                 await websocket.send_json({"error": "unknown job"})
                 break
             if data != prev:
-                response = {
-                    "status": data.get("status"),
-                    "uploaded": int(data.get("uploaded", 0)),
-                    "total": int(data.get("total", 0)) or None,
-                    "rows": int(data.get("rows", 0)),
-                    "table": data.get("table") or None,
-                    "error": data.get("error") or None,
-                }
-                await websocket.send_json(response)
-                prev = data
+                await websocket.send_json(data)
+                prev = dict(data)
                 if data.get("status") in {"completed", "failed"}:
                     break
             await asyncio.sleep(1)
     finally:
         await websocket.close()
 
-
+# -----------------------------------------------------------------------------
+# Health
+# -----------------------------------------------------------------------------
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    try:
+        with duckdb.connect(DB_PATH, read_only=True) as con:
+            con.execute("SELECT 1")
+        redis_client.ping()
+        return {"status": "ok"}
+    except Exception as e:
+        return {"status": "error", "detail": str(e)}

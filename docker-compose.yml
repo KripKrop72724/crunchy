@@ -1,28 +1,49 @@
-version: "3.9"
 services:
-  api:
-    build: .
-    env_file: .env
-    volumes:
-      - ./data:/data
-    ports:
-      - "8000:8000"
-    depends_on:
-      - redis
-  frontend:
-    build: ./frontend
-    ports:
-      - "5173:5173"
-    environment:
-      - VITE_API_URL=http://api:8000
-      - VITE_WS_URL=ws://api:8000
-    depends_on:
-      - api
   redis:
     image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes", "--save", "60", "1", "--loglevel", "warning"]
     ports:
       - "6379:6379"
     volumes:
       - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  api:
+    build: .
+    # Use the correct import path OR rely on Dockerfile CMD.
+    # If you prefer to be explicit, uncomment the next line:
+    # command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    env_file: .env
+    environment:
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      PYTHONUNBUFFERED: "1"
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/data       # DB_PATH=/data/analytics.duckdb
+      - ./uploads:/uploads # UPLOAD_DIR=/uploads
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  worker:
+    build: .
+    env_file: .env
+    command: ["rq", "worker", "-u", "${REDIS_URL:-redis://redis:6379/0}"]
+    environment:
+      PYTHONUNBUFFERED: "1"
+    volumes:
+      - ./data:/data
+      - ./uploads:/uploads
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
 volumes:
   redis-data:
