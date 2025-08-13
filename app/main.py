@@ -97,32 +97,27 @@ def quote_ident(name: str) -> str:
 
 def _nonempty_predicate(cols: List[str], alias: str = "s") -> str:
     """
-    Return a SQL boolean expression that is TRUE when at least one of the given
-    columns (present in the current staging) is non-empty after TRIM.
-    Uses only provided `cols` (e.g., the columns present in the new file).
+    TRUE when at least one of the given columns is non-empty after TRIM.
+    Uses only provided `cols` (present in the new file).
     """
     if not cols:
-        # If we somehow have no columns, treat all rows as empty ⇒ filter out everything.
         return "FALSE"
     pieces = []
     for c in cols:
-        # TRIM(CAST(s."col" AS VARCHAR)) <> ''
         pieces.append(f"(TRIM(CAST({alias}.{quote_ident(c)} AS VARCHAR)) <> '')")
     return " OR ".join(pieces)
 
 
 def quote_any_ident(name: str) -> str:
-    """Loose: safely quote *any* identifier (raw CSV header, may have spaces, symbols)."""
+    """Loose: safely quote *any* identifier (raw CSV header, may have spaces/symbols)."""
     return '"' + str(name).replace('"', '""') + '"'
 
 
 def _sql_literal(s: str) -> str:
-    # Safely embed a path or text in a SQL string literal
     return s.replace("'", "''")
 
 
 def clean_col(name: str) -> str:
-    # lower → replace spaces/dashes with _ → drop non [A-Za-z0-9_]
     n = (name or "").strip().lower().replace(" ", "_").replace("-", "_")
     n = re.sub(r"[^a-z0-9_]", "", n)
     if not n or n[0].isdigit():
@@ -134,6 +129,14 @@ def _json_default(obj: Any):
     if isinstance(obj, (date, datetime)):
         return obj.isoformat()
     raise TypeError
+
+
+# -----------------------------------------------------------------------------
+# Auth
+# -----------------------------------------------------------------------------
+def verify_api_key(x_api_key: str = Header(None)):
+    if API_KEY and x_api_key != API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid API Key")
 
 
 # richer job status helpers
@@ -193,10 +196,7 @@ def status_get(job_id: str) -> dict:
 
 
 def _maybe_optimize(con: duckdb.DuckDBPyConnection) -> None:
-    """
-    Best-effort storage maintenance across DuckDB versions.
-    Tries VACUUM or PRAGMA checkpoint; ignores if unsupported.
-    """
+    """Best-effort storage maintenance across DuckDB versions."""
     for stmt in ("VACUUM", "PRAGMA checkpoint"):
         try:
             con.execute(f"{stmt};")
@@ -211,7 +211,7 @@ def _maybe_optimize(con: duckdb.DuckDBPyConnection) -> None:
 LOCK_TEXT = "Could not set lock on file"
 
 def _connect_duckdb_with_retry(read_only: bool, attempts: int = 20):
-    delay = 0.05  # 50ms initial
+    delay = 0.05
     last: Optional[Exception] = None
     for _ in range(attempts):
         try:
@@ -220,11 +220,10 @@ def _connect_duckdb_with_retry(read_only: bool, attempts: int = 20):
             msg = str(e)
             if LOCK_TEXT in msg:
                 time.sleep(delay + random.random() * delay * 0.5)
-                delay = min(delay * 2, 1.0)  # backoff up to 1s
+                delay = min(delay * 2, 1.0)
                 last = e
                 continue
             raise
-    # If we can't connect after retries, rethrow the last lock error
     if last:
         raise last
     raise duckdb.IOException("Database is busy.")
@@ -242,7 +241,6 @@ def db_open(read_only: bool):
 
 @app.exception_handler(duckdb.IOException)
 async def duckdb_io_handler(request, exc: duckdb.IOException):
-    # If it's the file lock error, return a 503 instead of a 500
     if LOCK_TEXT in str(exc):
         return PlainTextResponse("Database is busy, please retry shortly.", status_code=503)
     return PlainTextResponse("Database error.", status_code=500)
@@ -250,7 +248,6 @@ async def duckdb_io_handler(request, exc: duckdb.IOException):
 
 # --- helpers for CSV pre-cleaning -------------------------------------------
 def _detect_bom(path: str) -> Optional[str]:
-    # Minimal BOM sniff; returns an encoding to use if obvious
     with open(path, "rb") as fh:
         head = fh.read(4)
     if head.startswith(b"\xff\xfe"):
@@ -264,46 +261,39 @@ def _detect_bom(path: str) -> Optional[str]:
 
 def _preclean_csv_to_temp(src_path: str) -> str:
     """
-    Make a 'best effort' cleaned copy next to the original:
+    Make a cleaned copy next to the original:
       - normalize newlines to LF
       - remove NUL/zero-width
-      - coalesce physical lines until quotes balance (fixes embedded newlines)
-    Returns the cleaned file path.
+      - coalesce physical lines until quotes balance
     """
     import io
 
     enc = _detect_bom(src_path) or "utf-8"
     out_path = src_path + ".clean.csv"
 
-    # Read bytes -> text with replacement (never crash)
     with open(src_path, "rb") as fh:
         raw = fh.read()
 
     try:
         txt = raw.decode(enc, errors="replace")
     except Exception:
-        # As a last resort, Latin-1 never fails
         txt = raw.decode("iso-8859-1", errors="replace")
 
-    # Normalize newlines, strip NULs / zero-width junk
     txt = txt.replace("\r\n", "\n").replace("\r", "\n")
     txt = txt.replace("\x00", "").replace("\u200b", "")
 
-    # Stitch lines until quotes balance (handles embedded newlines inside fields)
     out_lines: List[str] = []
     buf: List[str] = []
-    open_quotes = 0  # count of unescaped double-quotes seen so far in the logical row
+    open_quotes = 0
 
     def _add_line_part(part: str):
         nonlocal open_quotes
         buf.append(part)
-        # Count quotes; doubled quotes "" count as 2, which keeps parity correct
         open_quotes = (open_quotes + part.count('"')) % 2
 
     for phys_line in io.StringIO(txt):
         phys = phys_line.rstrip("\n")
         _add_line_part(phys)
-
         if open_quotes == 0:
             out_lines.append("".join(buf))
             buf.clear()
@@ -321,24 +311,20 @@ def _preclean_csv_to_temp(src_path: str) -> str:
 # Robust CSV ingestion
 # -----------------------------------------------------------------------------
 def _guess_delimiter(sample: str) -> Optional[str]:
-    # Quick heuristic: pick the delimiter with the most consistent count across lines
     candidates = [",", ";", "|", "\t"]
-    lines = [ln for ln in sample.splitlines() if ln.strip()]
-    lines = lines[:50]
+    lines = [ln for ln in sample.splitlines() if ln.strip()][:50]
     if not lines:
         return None
-    best = None
-    best_score = -1
+    best, best_score = None, -1
     for d in candidates:
         counts = [ln.count(d) for ln in lines]
         if max(counts) == 0:
             continue
-        mean = sum(counts) / len(counts)
-        var = sum((c - mean) ** 2 for c in counts) / len(counts)
-        score = mean - var  # prefer high mean, low variance
+        mean = sum(counts)/len(counts)
+        var = sum((c-mean)**2 for c in counts)/len(counts)
+        score = mean - var
         if score > best_score:
-            best_score = score
-            best = d
+            best_score, best = score, d
     return best
 
 
@@ -347,8 +333,7 @@ def create_staging_from_csv(con: duckdb.DuckDBPyConnection, safe_staging: str, f
     Robust loader:
       1) tolerant read_csv_auto
       2) matrix of (enc × delim × header × quote × newline) with BOTH token and literal newline values
-      3) pre-clean file (normalize + stitch rows) and repeat 1)+2)
-    Only uses parameters your build supports (from the "Candidates" list).
+      3) pre-clean file and repeat
     """
     def _read_peek(path: str) -> str:
         try:
@@ -384,14 +369,12 @@ def create_staging_from_csv(con: duckdb.DuckDBPyConnection, safe_staging: str, f
         encodings = ["utf-8", "utf-8-sig", "utf-16", "windows-1252", "iso-8859-1"]
         header_opts = [True, False]
         quotes = ['"', "'"]
-        # Try tokens DuckDB might accept in some versions + literal values that always work
         newlines = ["auto", "LF", "CRLF", "CR", "\n", "\r\n", "\r", "lf", "crlf", "cr"]
 
         last_err = None
         for enc in encodings:
             for delim in delims:
                 for nl in newlines:
-                    # a) normal quoting
                     for q in quotes:
                         for hdr in header_opts:
                             try:
@@ -415,7 +398,6 @@ def create_staging_from_csv(con: duckdb.DuckDBPyConnection, safe_staging: str, f
                             except duckdb.Error as e2:
                                 last_err = str(e2)
                                 continue
-                    # b) quoting disabled
                     for hdr in header_opts:
                         try:
                             con.execute(f"""
@@ -440,7 +422,6 @@ def create_staging_from_csv(con: duckdb.DuckDBPyConnection, safe_staging: str, f
                             continue
         return last_err
 
-    # ---- Attempt set #1: original file
     err = _try_auto(file_path)
     if err is None:
         return
@@ -448,7 +429,6 @@ def create_staging_from_csv(con: duckdb.DuckDBPyConnection, safe_staging: str, f
     if err is None:
         return
 
-    # ---- Attempt set #2: pre-cleaned file then try again
     cleaned = _preclean_csv_to_temp(file_path)
     try:
         err2 = _try_auto(cleaned)
@@ -458,7 +438,6 @@ def create_staging_from_csv(con: duckdb.DuckDBPyConnection, safe_staging: str, f
         if err2 is None:
             return
     finally:
-        # always remove the cleaned temp
         try:
             os.remove(cleaned)
         except FileNotFoundError:
@@ -488,27 +467,19 @@ class DistinctQuery(BaseModel):
 
 
 class BulkDeleteRequest(BaseModel):
-    # Delete by a set of row hashes (recommended when deleting selected rows from the grid)
     row_hashes: Optional[List[int]] = None
-    # Or delete by filters (same shape as your /query filters)
     filters: Dict[str, List[str]] = {}
-    # Optionally restrict to specific source file names (matches "__source_file")
     source_files: Optional[List[str]] = None
-    # Safety controls
     dry_run: bool = False
     confirm: bool = False
     expected_min: Optional[int] = None
     expected_max: Optional[int] = None
-    # If deleting by source_files, optionally drop their file records so re-uploads are not skipped
     drop_file_records: bool = False
 
 
 class ClearRequest(BaseModel):
-    # what to clear: "dataset", "files", "uploads", "redis", or "all"
     scope: str = "all"
-    # safety
     confirm: bool = False
-    # must equal exactly "DELETE ALL" when scope implies wiping the dataset
     confirm_token: Optional[str] = None
 
 
@@ -522,7 +493,6 @@ def list_user_columns(con: duckdb.DuckDBPyConnection) -> List[str]:
 
 
 def ensure_columns(con: duckdb.DuckDBPyConnection, cols: List[str]) -> None:
-    """Add missing user columns to dataset (all VARCHAR). Safe under concurrency."""
     current = set(list_user_columns(con))
     for c in cols:
         if c in current:
@@ -530,7 +500,6 @@ def ensure_columns(con: duckdb.DuckDBPyConnection, cols: List[str]) -> None:
         try:
             con.execute(f'ALTER TABLE dataset ADD COLUMN {quote_ident(c)} VARCHAR;')
         except duckdb.Error as e:
-            # If another worker added it concurrently, ignore
             log.debug("ADD COLUMN race tolerated for %s: %s", c, e)
 
 
@@ -538,7 +507,6 @@ def ensure_columns(con: duckdb.DuckDBPyConnection, cols: List[str]) -> None:
 # File metadata write
 # -----------------------------------------------------------------------------
 def record_file(con: duckdb.DuckDBPyConnection, job_id: str, filename: str, file_hash: str) -> None:
-    # Insert only if (filename, file_hash) is new. Works without ON CONFLICT support.
     con.execute(
         """
         INSERT INTO files(file_id, filename, file_hash)
@@ -562,7 +530,6 @@ def process_file(job_id: str, file_path: str, file_hash: str, orig_filename: str
 
     try:
         with db_open(read_only=False) as con:
-            # double-check file-level dedup
             exists = con.execute(
                 "SELECT 1 FROM files WHERE filename=? AND file_hash=? LIMIT 1",
                 (orig_filename, file_hash)
@@ -595,13 +562,11 @@ def process_file(job_id: str, file_path: str, file_hash: str, orig_filename: str
             else:
                 raise ValueError("Unsupported file type (csv/tsv/txt, parquet, or excel)")
 
-            # normalize columns (rename raw headers → cleaned names)
             status_set(job_id, stage="schema_evolved")
             info = con.execute(f"PRAGMA table_info({safe_staging})").fetchall()
             orig_cols = [r[1] for r in info]
             mapping = {c: clean_col(c) for c in orig_cols}
 
-            # ensure uniqueness after cleaning (append _1, _2 … if needed)
             seen = set()
             for k, v in list(mapping.items()):
                 base, i = v, 1
@@ -610,7 +575,6 @@ def process_file(job_id: str, file_path: str, file_hash: str, orig_filename: str
                     i += 1
                 seen.add(mapping[k])
 
-            # RENAME using *loose* quoting for original headers, strict for cleaned
             for orig, new in mapping.items():
                 if orig != new:
                     con.execute(
@@ -618,14 +582,11 @@ def process_file(job_id: str, file_path: str, file_hash: str, orig_filename: str
                     )
 
             new_cols = list(mapping.values())
-            # ensure columns exist in dataset
             ensure_columns(con, new_cols)
 
-            # union of user columns in dataset AFTER evolution
             all_user_cols = list_user_columns(con)
             all_user_cols.sort()
 
-            # count rows to drive progress
             status_set(job_id, stage="counting")
             rows_total = con.execute(f"SELECT COUNT(*) FROM {safe_staging}").fetchone()[0]
             status_set(job_id, rows_total=rows_total)
@@ -636,11 +597,9 @@ def process_file(job_id: str, file_path: str, file_hash: str, orig_filename: str
                            ended_at=datetime.utcnow().isoformat())
                 return
 
-            # add a stable row_number for batching
             con.execute(
                 f'CREATE TEMP TABLE {staging}_rn AS SELECT *, row_number() OVER () AS __rn FROM {safe_staging};')
 
-            # build per-column expressions for projection and hashing w/ alias s
             proj_parts = []
             hash_parts = []
             for c in all_user_cols:
@@ -664,9 +623,8 @@ def process_file(job_id: str, file_path: str, file_hash: str, orig_filename: str
                 before_cnt = con.execute("SELECT COUNT(*) FROM dataset").fetchone()[0]
 
                 user_cols_csv = ", ".join(quote_ident(c) for c in all_user_cols)
-                target_cols_csv = f"{user_cols_csv}, row_hash, __source_file, ___ingested_at"
+                target_cols_csv = f"{user_cols_csv}, row_hash, __source_file, __ingested_at"
 
-                # Build a predicate to drop fully-empty rows (based on columns actually present in this file)
                 nonempty = _nonempty_predicate(new_cols, alias="s")
 
                 sql = f"""
@@ -713,7 +671,6 @@ def process_file(job_id: str, file_path: str, file_hash: str, orig_filename: str
                     progress=progress
                 )
 
-            # record file & cleanup
             record_file(con, job_id, orig_filename, file_hash)
             status_set(job_id, status="completed", stage="completed", progress=1.0,
                        ended_at=datetime.utcnow().isoformat())
@@ -723,14 +680,12 @@ def process_file(job_id: str, file_path: str, file_hash: str, orig_filename: str
         log.exception("Ingestion failed for job %s", job_id)
         status_set(job_id, status="failed", stage="failed", error=str(e), ended_at=datetime.utcnow().isoformat())
     finally:
-        # Always attempt to clean up staging temps, even on failure
         try:
             with db_open(read_only=False) as con2:
                 con2.execute(f"DROP TABLE IF EXISTS {safe_staging}")
                 con2.execute(f"DROP TABLE IF EXISTS {staging}_rn")
         except Exception:
             pass
-        # Remove any pre-cleaned temp file we might have created
         try:
             os.remove(str(file_path) + ".clean.csv")
         except FileNotFoundError:
@@ -771,7 +726,6 @@ async def upload(
         ended_at="",
     )
 
-    # stream save and sha256 on the fly
     hasher = hashlib.sha256()
     try:
         async with aiofiles.open(dest_path, "wb") as out:
@@ -796,7 +750,6 @@ async def upload(
 
     file_hash = hasher.hexdigest()
 
-    # File-level dedup check
     with db_open(read_only=True) as con:
         exists = con.execute(
             "SELECT 1 FROM files WHERE filename=? AND file_hash=? LIMIT 1",
@@ -806,7 +759,6 @@ async def upload(
         status_set(job_id, status="completed", stage="completed", progress=1.0, ended_at=datetime.utcnow().isoformat())
         return {"job_id": job_id, "skipped": True}
 
-    # queue ingestion
     status_set(job_id, status="queued", stage="queued")
     queue.enqueue(process_file, job_id, str(dest_path), file_hash, file.filename)
     return {"job_id": job_id}
@@ -820,7 +772,6 @@ def status(job_id: str, _: None = Depends(verify_api_key)):
     return JSONResponse(data)
 
 
-# Optional SSE stream of status (handy if you don't want websockets)
 @app.get("/status/stream/{job_id}")
 async def status_stream(job_id: str, _: None = Depends(verify_api_key)):
     async def gen():
@@ -853,7 +804,6 @@ def columns(response: Response, _: None = Depends(verify_api_key)):
         total = con.execute("SELECT COUNT(*) FROM dataset").fetchone()[0]
         cols = [] if total == 0 else list_user_columns(con)
 
-    # anti-cache + version
     response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
     response.headers["Pragma"] = "no-cache"
     response.headers["Expires"] = "0"
@@ -894,12 +844,9 @@ def distinct_values(response: Response,
 # -----------------------------------------------------------------------------
 @app.post("/query")
 def simple_query(body: SimpleQueryRequest, _: None = Depends(verify_api_key)):
-    # Normalize empty fields list → None (treat as “all user columns”)
     if body.fields is not None and len(body.fields) == 0:
         body.fields = None
 
-    # cache
-    # include dataset version so cache is instantly invalidated on mutations
     version = _get_dataset_version()
     raw_key = f"v={version}|{json.dumps(body.dict(), sort_keys=True)}"
     cache_key = hashlib.sha256(raw_key.encode()).hexdigest()
@@ -915,7 +862,6 @@ def simple_query(body: SimpleQueryRequest, _: None = Depends(verify_api_key)):
         user_cols_list = list_user_columns(con)
         user_cols = set(user_cols_list)
 
-        # If there are no user columns at all (fresh DB), return empty result gracefully
         if not user_cols_list:
             result = {"rows": [], "total": 0}
             try:
@@ -924,7 +870,6 @@ def simple_query(body: SimpleQueryRequest, _: None = Depends(verify_api_key)):
                 pass
             return result
 
-        # projection
         if body.fields:
             for c in body.fields:
                 if c not in user_cols:
@@ -943,7 +888,6 @@ def simple_query(body: SimpleQueryRequest, _: None = Depends(verify_api_key)):
 
         select_cols = ", ".join(quote_ident(c) for c in fields)
 
-        # WHERE col IN (...) AND col2 IN (...)
         where_clauses = []
         params: List[Any] = []
         for c, vals in body.filters.items():
@@ -968,7 +912,6 @@ def simple_query(body: SimpleQueryRequest, _: None = Depends(verify_api_key)):
         rows = cursor.fetchall()
         col_names = [d[0] for d in cursor.description]
 
-        # Total for pagination (same filters)
         count_sql = f"SELECT COUNT(*) FROM dataset {where_sql}"
         total = con.execute(count_sql, params[:-2]).fetchone()[0]
 
@@ -985,7 +928,6 @@ def simple_query(body: SimpleQueryRequest, _: None = Depends(verify_api_key)):
 # -----------------------------------------------------------------------------
 @app.post("/stream")
 def stream_query(body: SimpleQueryRequest, _: None = Depends(verify_api_key)):
-    # Normalize empty fields list → None
     if body.fields is not None and len(body.fields) == 0:
         body.fields = None
 
@@ -998,7 +940,6 @@ def stream_query(body: SimpleQueryRequest, _: None = Depends(verify_api_key)):
                 if False:
                     yield ""
                 return
-
             return StreamingResponse(empty(), media_type="application/x-ndjson")
 
         if body.fields:
@@ -1014,7 +955,6 @@ def stream_query(body: SimpleQueryRequest, _: None = Depends(verify_api_key)):
                 if False:
                     yield ""
                 return
-
             return StreamingResponse(empty(), media_type="application/x-ndjson")
 
         select_cols = ", ".join(quote_ident(c) for c in fields)
@@ -1066,27 +1006,21 @@ def _build_base_where_for_delete(
         filters: Dict[str, List[str]],
         source_files: Optional[List[str]]
 ) -> Tuple[str, List[Any]]:
-    """
-    Build a WHERE clause & params using user columns + optional __source_file restriction.
-    """
     user_cols_list = list_user_columns(con)
     user_cols = set(user_cols_list)
 
     clauses: List[str] = []
     params: List[Any] = []
 
-    # user columns (IN-list semantics, AND across columns)
     for c, vals in filters.items():
         if c not in user_cols:
             raise HTTPException(400, f"Unknown column: {c}")
         if not vals:
-            # empty list means no-op for this column
             continue
         placeholders = ", ".join("?" for _ in vals)
         clauses.append(f'{quote_ident(c)} IN ({placeholders})')
         params.extend(vals)
 
-    # optional __source_file
     if source_files:
         placeholders = ", ".join("?" for _ in source_files)
         clauses.append('"__source_file" IN (' + placeholders + ')')
@@ -1099,17 +1033,13 @@ def _build_base_where_for_delete(
 @app.post("/delete")
 def bulk_delete(body: BulkDeleteRequest, _: None = Depends(verify_api_key)):
     if not body.row_hashes and not body.filters and not body.source_files:
-        # avoid accidental full-table deletes; use /admin/clear for wipes
         raise HTTPException(400, "No delete criteria supplied (row_hashes | filters | source_files).")
 
-    # Normalize an empty list to None so we don't build 'IN ()'
     row_hashes = body.row_hashes if body.row_hashes else None
 
     with db_open(read_only=False) as con:
-        # Base WHERE (filters + optional source file restriction)
         base_where, base_params = _build_base_where_for_delete(con, body.filters, body.source_files)
 
-        # Count matches
         matched = 0
         if row_hashes:
             for chunk in _chunks(row_hashes, 5000):
@@ -1119,11 +1049,9 @@ def bulk_delete(body: BulkDeleteRequest, _: None = Depends(verify_api_key)):
         else:
             matched = con.execute(f"SELECT COUNT(*) FROM dataset {base_where}", base_params).fetchone()[0]
 
-        # If dry-run, just report
         if body.dry_run:
             return {"matched": matched, "deleted": 0, "dry_run": True}
 
-        # Safety gates
         if not body.confirm:
             raise HTTPException(400, "Set confirm=true to perform the delete (use dry_run first).")
         if body.expected_min is not None and matched < body.expected_min:
@@ -1131,7 +1059,6 @@ def bulk_delete(body: BulkDeleteRequest, _: None = Depends(verify_api_key)):
         if body.expected_max is not None and matched > body.expected_max:
             raise HTTPException(409, f"Matched {matched} rows, above expected_max={body.expected_max}.")
 
-        # Perform deletes inside a transaction; chunk when using row_hashes
         deleted = 0
         con.execute("BEGIN TRANSACTION;")
         try:
@@ -1139,7 +1066,6 @@ def bulk_delete(body: BulkDeleteRequest, _: None = Depends(verify_api_key)):
                 for chunk in _chunks(row_hashes, 5000):
                     placeholders = ", ".join("?" for _ in chunk)
                     where = base_where + ((" AND " if base_where else "WHERE ") + f"row_hash IN ({placeholders})")
-                    # Count then delete (DuckDB doesn't expose changes() like SQLite)
                     n = con.execute(f"SELECT COUNT(*) FROM dataset {where}", (*base_params, *chunk)).fetchone()[0]
                     con.execute(f"DELETE FROM dataset {where}", (*base_params, *chunk))
                     deleted += n
@@ -1148,17 +1074,14 @@ def bulk_delete(body: BulkDeleteRequest, _: None = Depends(verify_api_key)):
                 con.execute(f"DELETE FROM dataset {base_where}", base_params)
                 deleted += n
 
-            # If we deleted by source_files and user asked to drop file records, remove from files table too
             if body.source_files and body.drop_file_records:
                 placeholders = ", ".join("?" for _ in body.source_files)
                 con.execute(f"DELETE FROM files WHERE filename IN ({placeholders})", body.source_files)
 
-            # Keep DB tidy after big deletes
             if deleted >= 100_000:
                 _maybe_optimize(con)
 
             con.execute("COMMIT;")
-            # invalidate caches immediately so UI filters refresh
             if deleted > 0:
                 _bump_dataset_version()
 
@@ -1175,11 +1098,8 @@ def bulk_delete(body: BulkDeleteRequest, _: None = Depends(verify_api_key)):
 @app.post("/admin/clear")
 def admin_clear(body: ClearRequest, _: None = Depends(verify_api_key)):
     scope = (body.scope or "all").lower()
-
-    # Determine if the operation wipes dataset
     wipes_dataset = scope in ("dataset", "all")
 
-    # Strong confirmation for dataset wipes
     if wipes_dataset:
         if not body.confirm or body.confirm_token != "DELETE ALL":
             raise HTTPException(
@@ -1192,21 +1112,29 @@ def admin_clear(body: ClearRequest, _: None = Depends(verify_api_key)):
 
     cleared = []
 
-    # DuckDB objects
     if scope in ("dataset", "all"):
         with db_open(read_only=False) as con:
-            # Delete all rows but keep schema & index
             con.execute("BEGIN TRANSACTION;")
             try:
+                # empty the table first
                 con.execute("DELETE FROM dataset;")
-                # drop all user columns too
+
+                # drop dependent index so DROP COLUMN can proceed
+                con.execute("DROP INDEX IF EXISTS idx_dataset_rowhash;")
+
+                # drop all user columns (keep internal ones)
                 user_cols = [c for c in list_user_columns(con)]
                 for c in user_cols:
                     con.execute(f'ALTER TABLE dataset DROP COLUMN {quote_ident(c)};')
+
                 if scope == "all":
                     con.execute("DELETE FROM files;")
-                # tidy DB
+
                 _maybe_optimize(con)
+
+                # recreate the index on row_hash
+                con.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_dataset_rowhash ON dataset(row_hash);")
+
                 con.execute("COMMIT;")
                 cleared.append("dataset")
                 if scope == "all":
@@ -1223,7 +1151,6 @@ def admin_clear(body: ClearRequest, _: None = Depends(verify_api_key)):
             cleared.append("files")
             _bump_dataset_version()
 
-    # Uploads on disk
     if scope in ("uploads", "all"):
         cnt = 0
         try:
@@ -1238,7 +1165,6 @@ def admin_clear(body: ClearRequest, _: None = Depends(verify_api_key)):
             pass
         cleared.append(f"uploads:{cnt}")
 
-    # Redis job state
     if scope in ("redis", "all"):
         removed = 0
         try:
@@ -1287,7 +1213,6 @@ async def ws_status(websocket: WebSocket, job_id: str):
 def startup_event():
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     with db_open(read_only=False) as con:
-        # Create tables if missing (fresh DBs get UBIGINT immediately)
         con.execute("""
             CREATE TABLE IF NOT EXISTS dataset (
                 row_hash      UBIGINT,
@@ -1305,21 +1230,16 @@ def startup_event():
             );
         """)
 
-        # Check current type of row_hash
         info = con.execute("PRAGMA table_info('dataset')").fetchall()
-        types = {r[1]: (r[2] or "").upper() for r in info}  # col_name -> TYPE
+        types = {r[1]: (r[2] or "").upper() for r in info}
 
-        # If legacy BIGINT, migrate to UBIGINT:
         if types.get("row_hash", "") != "UBIGINT":
-            # 1) Drop the index that depends on the column type (if it exists)
             con.execute("DROP INDEX IF EXISTS idx_dataset_rowhash;")
-            # 2) Alter the column type (support both syntaxes across DuckDB versions)
             try:
                 con.execute("ALTER TABLE dataset ALTER COLUMN row_hash TYPE UBIGINT;")
             except duckdb.Error:
                 con.execute("ALTER TABLE dataset ALTER COLUMN row_hash SET DATA TYPE UBIGINT;")
 
-        # 3) Ensure unique index is present (idempotent)
         con.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_dataset_rowhash ON dataset(row_hash);")
 
 
