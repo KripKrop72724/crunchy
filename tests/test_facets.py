@@ -42,6 +42,7 @@ def test_facets_basic():
         data = resp.json()
         assert data["total"] == 2
         assert data["columns"] == ["country", "status"]
+        assert data["applied_limit"] is None
         assert data["facets"]["country"][0] == {"value": "USA", "count": 2}
         assert {"value": "Canada", "count": 1} in data["facets"]["country"]
         assert {"value": "Germany", "count": 1} in data["facets"]["country"]
@@ -57,6 +58,27 @@ def test_facets_basic():
         )
         assert resp2.status_code == 200
         data2 = resp2.json()
+        assert data2["applied_limit"] is None
         assert data2["facets"]["country"] == [{"value": "USA", "count": 2}]
+
+        resp3 = client.post(
+            "/facets",
+            headers={"X-API-Key": "changeme"},
+            json={"fields": ["country"], "limit": 1},
+        )
+        assert resp3.status_code == 200
+        data3 = resp3.json()
+        assert data3["applied_limit"] == 1
+        assert data3["facets"]["country"] == [{"value": "USA", "count": 2}]
+
+        resp4 = client.post(
+            "/facets",
+            headers={"X-API-Key": "changeme"},
+            json={"fields": ["country"], "limit": 0},
+        )
+        assert resp4.status_code == 200
+        data4 = resp4.json()
+        assert data4["applied_limit"] is None
+        assert len(data4["facets"]["country"]) == 3
     finally:
         tmpdir.cleanup()

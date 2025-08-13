@@ -498,6 +498,8 @@ class FacetRequest(BaseModel):
     # ordering for each facet’s values
     #   "count_desc" (default), "value_asc", "value_desc"
     order: Optional[str] = "count_desc"
+    # NEW: skip redis cache entirely for this call
+    no_cache: bool = False
 
 
 class BulkDeleteRequest(BaseModel):
@@ -861,8 +863,9 @@ def distinct_values(
     if q:
         where_sql = f"WHERE {col} IS NOT NULL AND {col} ILIKE ?"
         params.append(f"%{q}%")
-    limit_sql = " LIMIT ?" if limit is not None else ""
-    params_ext = (*params, limit) if limit is not None else tuple(params)
+    limit_val = limit if (limit is not None and limit > 0) else None
+    limit_sql = " LIMIT ?" if limit_val is not None else ""
+    params_ext = (*params, limit_val) if limit_val is not None else tuple(params)
 
     with db_open(read_only=True) as con:
         rows = con.execute(
@@ -874,7 +877,7 @@ def distinct_values(
     response.headers["Pragma"] = "no-cache"
     response.headers["Expires"] = "0"
     response.headers["X-Dataset-Version"] = str(_get_dataset_version())
-    return {"values": [r[0] for r in rows]}
+    return {"values": [r[0] for r in rows], "applied_limit": limit_val}
 
 
 @app.post("/facets")
@@ -884,18 +887,21 @@ def facet_counts(body: FacetRequest, _: None = Depends(verify_api_key)):
     Honors current filters; by default uses 'exclude_self' semantics so that
     when computing counts for column C, the filter on C is ignored.
     """
-    # cache key tied to dataset version + request body
+    # cache key tied to dataset version + request body (namespaced)
     version = _get_dataset_version()
     raw_key = f"facets|v={version}|{json.dumps(body.dict(), sort_keys=True)}"
-    cache_key = hashlib.sha256(raw_key.encode()).hexdigest()
+    cache_key = "cache:facets:" + hashlib.sha256(raw_key.encode()).hexdigest()
 
-    # try cache
-    try:
-        cached = redis_client.get(cache_key)
-    except RedisError:
-        cached = None
+    cached = None
+    if not body.no_cache:
+        try:
+            cached = redis_client.get(cache_key)
+        except RedisError:
+            pass
     if cached:
         return json.loads(cached)
+
+    limit_val = body.limit if (body.limit is not None and body.limit > 0) else None
 
     with db_open(read_only=True) as con:
         user_cols_list = list_user_columns(con)
@@ -903,11 +909,12 @@ def facet_counts(body: FacetRequest, _: None = Depends(verify_api_key)):
 
         # no user columns → empty result
         if not user_cols_list:
-            result = {"facets": {}, "total": 0, "columns": []}
-            try:
-                redis_client.setex(cache_key, QUERY_CACHE_TTL, json.dumps(result))
-            except RedisError:
-                pass
+            result = {"facets": {}, "total": 0, "columns": [], "applied_limit": limit_val}
+            if not body.no_cache:
+                try:
+                    redis_client.setex(cache_key, QUERY_CACHE_TTL, json.dumps(result))
+                except RedisError:
+                    pass
             return result
 
         # validate requested fields or default to "all user columns"
@@ -967,8 +974,8 @@ def facet_counts(body: FacetRequest, _: None = Depends(verify_api_key)):
             if extra_clauses:
                 where2 = where_sql + ((" AND " if where_sql else "WHERE ") + " AND ".join(extra_clauses))
 
-            limit_sql = " LIMIT ?" if body.limit is not None else ""
-            params_ext = (*params, body.limit) if body.limit is not None else tuple(params)
+            limit_sql = " LIMIT ?" if limit_val is not None else ""
+            params_ext = (*params, limit_val) if limit_val is not None else tuple(params)
 
             q = f"""
                 SELECT CAST({quote_ident(col)} AS VARCHAR) AS v, COUNT(*) AS n
@@ -980,13 +987,13 @@ def facet_counts(body: FacetRequest, _: None = Depends(verify_api_key)):
             rows = con.execute(q, params_ext).fetchall()
             out[col] = [{"value": r[0], "count": r[1]} for r in rows]
 
-    result = {"facets": out, "total": total_rows, "columns": fields}
+    result = {"facets": out, "total": total_rows, "columns": fields, "applied_limit": limit_val}
 
-    # cache it
-    try:
-        redis_client.setex(cache_key, QUERY_CACHE_TTL, json.dumps(result))
-    except RedisError:
-        pass
+    if not body.no_cache:
+        try:
+            redis_client.setex(cache_key, QUERY_CACHE_TTL, json.dumps(result))
+        except RedisError:
+            pass
 
     return result
 
@@ -1348,6 +1355,21 @@ def admin_clear(body: ClearRequest, _: None = Depends(verify_api_key)):
         except RedisError as e:
             log.warning("Redis scan/delete failed: %s", e)
         cleared.append(f"redis:{removed}")
+
+    if scope in ("cache", "all"):
+        removed = 0
+        try:
+            cur = 0
+            while True:
+                cur, keys = redis_client.scan(cur, match="cache:*")
+                if keys:
+                    redis_client.delete(*keys)
+                    removed += len(keys)
+                if cur == 0:
+                    break
+        except RedisError as e:
+            log.warning("Redis scan/delete failed (cache:*): %s", e)
+        cleared.append(f"cache:{removed}")
 
     return {"ok": True, "cleared": cleared}
 
