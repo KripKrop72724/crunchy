@@ -479,7 +479,8 @@ class SimpleQueryRequest(BaseModel):
 
 class DistinctQuery(BaseModel):
     q: Optional[str] = None
-    limit: conint(gt=0) = 200
+    # None means "no limit" (return all values)
+    limit: Optional[int] = None
 
 
 class FacetRequest(BaseModel):
@@ -487,8 +488,8 @@ class FacetRequest(BaseModel):
     filters: Dict[str, List[str]] = {}
     # which columns to facet; None = all user columns
     fields: Optional[List[str]] = None
-    # how many values per facet to return
-    limit: conint(gt=0) = 100
+    # None means "no limit" (unpaginated facets)
+    limit: Optional[int] = None
     # typical facet behavior: when computing counts for column X,
     # ignore X’s own filter so the UI can show all options for X
     exclude_self: bool = True
@@ -845,10 +846,11 @@ def columns(response: Response, _: None = Depends(verify_api_key)):
 
 
 @app.get("/distinct/{column}")
-def distinct_values(response: Response,
+def distinct_values(
+    response: Response,
     column: str,
     q: Optional[str] = None,
-    limit: conint(gt=0) = 200,
+    limit: Optional[int] = None,
     _: None = Depends(verify_api_key),
 ):
     if column in INTERNAL_COLS:
@@ -859,10 +861,13 @@ def distinct_values(response: Response,
     if q:
         where_sql = f"WHERE {col} IS NOT NULL AND {col} ILIKE ?"
         params.append(f"%{q}%")
+    limit_sql = " LIMIT ?" if limit is not None else ""
+    params_ext = (*params, limit) if limit is not None else tuple(params)
+
     with db_open(read_only=True) as con:
         rows = con.execute(
-            f"SELECT DISTINCT {col} AS v FROM dataset {where_sql} ORDER BY v LIMIT ?",
-            (*params, limit),
+            f"SELECT DISTINCT {col} AS v FROM dataset {where_sql} ORDER BY v{limit_sql}",
+            params_ext,
         ).fetchall()
 
     response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
@@ -962,15 +967,17 @@ def facet_counts(body: FacetRequest, _: None = Depends(verify_api_key)):
             if extra_clauses:
                 where2 = where_sql + ((" AND " if where_sql else "WHERE ") + " AND ".join(extra_clauses))
 
+            limit_sql = " LIMIT ?" if body.limit is not None else ""
+            params_ext = (*params, body.limit) if body.limit is not None else tuple(params)
+
             q = f"""
                 SELECT CAST({quote_ident(col)} AS VARCHAR) AS v, COUNT(*) AS n
                   FROM dataset
                   {where2}
                  GROUP BY 1
-                 ORDER BY {order_sql}
-                 LIMIT ?;
+                 ORDER BY {order_sql}{limit_sql};
             """
-            rows = con.execute(q, (*params, body.limit)).fetchall()
+            rows = con.execute(q, params_ext).fetchall()
             out[col] = [{"value": r[0], "count": r[1]} for r in rows]
 
     result = {"facets": out, "total": total_rows, "columns": fields}
