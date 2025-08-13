@@ -202,6 +202,200 @@ def status_get(job_id: str) -> dict:
     return out
 
 
+# --- helpers for CSV pre-cleaning -------------------------------------------
+def _detect_bom(path: str) -> Optional[str]:
+    # Minimal BOM sniff; returns an encoding to use if obvious
+    with open(path, "rb") as fh:
+        head = fh.read(4)
+    if head.startswith(b"\xff\xfe"):
+        return "utf-16-le"
+    if head.startswith(b"\xfe\xff"):
+        return "utf-16-be"
+    if head.startswith(b"\xef\xbb\xbf"):
+        return "utf-8-sig"
+    return None
+
+
+def _preclean_csv_to_temp(src_path: str) -> str:
+    """
+    Make a 'best effort' cleaned copy next to the original:
+      - normalize newlines to LF
+      - remove NULs
+      - coalesce physical lines until quotes balance (fixes embedded newlines)
+    Returns the cleaned file path.
+    """
+    import io
+
+    enc = _detect_bom(src_path) or "utf-8"
+    out_path = src_path + ".clean.csv"
+
+    # Read bytes -> text with replacement (never crash)
+    with open(src_path, "rb") as fh:
+        raw = fh.read()
+
+    try:
+        txt = raw.decode(enc, errors="replace")
+    except Exception:
+        # As a last resort, Latin-1 never fails
+        txt = raw.decode("iso-8859-1", errors="replace")
+
+    # Normalize newlines, strip NULs / zero-width junk
+    txt = txt.replace("\r\n", "\n").replace("\r", "\n")
+    txt = txt.replace("\x00", "").replace("\u200b", "")
+
+    # Stitch lines until quotes balance (handles embedded newlines inside fields)
+    out_lines: List[str] = []
+    buf = []
+    open_quotes = 0  # count of unescaped double-quotes seen so far in the logical row
+
+    def _add_line_part(part: str):
+        nonlocal open_quotes
+        buf.append(part)
+        # Count quotes; doubled quotes "" count as 2, which keeps parity correct
+        open_quotes = (open_quotes + part.count('"')) % 2
+
+    for phys_line in io.StringIO(txt):
+        # Preserve the physical content but without trailing newline (we add our own)
+        phys = phys_line.rstrip("\n")
+        _add_line_part(phys)
+
+        if open_quotes == 0:
+            # row boundary: flush buffer as one logical CSV line
+            out_lines.append("".join(buf))
+            buf.clear()
+
+    if buf:
+        # If file ends with dangling quotes, just flush what's there
+        out_lines.append("".join(buf))
+
+    cleaned = "\n".join(out_lines)
+    with open(out_path, "w", encoding="utf-8", newline="\n") as out:
+        out.write(cleaned)
+    return out_path
+
+
+# --- robust CSV → staging ----------------------------------------------------
+def create_staging_from_csv(con: duckdb.DuckDBPyConnection, safe_staging: str, file_path: str) -> None:
+    """
+    Robust CSV → table loader that:
+      1) tries tolerant read_csv_auto
+      2) falls back across encodings×delimiters×newline/quoting
+      3) if all fail, pre-cleans file and repeats (1)+(2)
+    Uses only options available in the DuckDB "Candidates" you posted.
+    """
+    def _try_read_csv_auto(path: str) -> Optional[str]:
+        try:
+            con.execute(f"""
+                CREATE OR REPLACE TABLE {safe_staging} AS
+                SELECT * FROM read_csv_auto('{_sql_literal(path)}',
+                    SAMPLE_SIZE=-1,
+                    HEADER=TRUE,
+                    NORMALIZE_NAMES=FALSE,
+                    ALL_VARCHAR=TRUE,
+                    IGNORE_ERRORS=TRUE,
+                    maximum_line_size='10000000',
+                    PARALLEL=FALSE
+                );
+            """)
+            return None
+        except duckdb.Error as e:
+            return str(e)
+
+    def _try_matrix(path: str) -> Optional[str]:
+        # small peek for delimiter guess
+        try:
+            with open(path, "rb") as fh:
+                head = fh.read(128 * 1024)
+            peek = head.decode("utf-8", errors="ignore")
+        except Exception:
+            peek = ""
+        guessed = _guess_delimiter(peek)
+
+        delims = [d for d in [guessed, ",", ";", "|", "\t"] if d]
+        encodings = ["utf-8", "utf-8-sig", "utf-16", "windows-1252", "iso-8859-1"]
+        quotes = ['"', "'"]
+        header_opts = [True, False]
+        newlines = ["auto", "LF", "CRLF"]
+
+        last_err = None
+
+        for enc in encodings:
+            for delim in delims:
+                for nl in newlines:
+                    # a) normal quoting
+                    for q in quotes:
+                        for hdr in header_opts:
+                            try:
+                                con.execute(f"""
+                                    CREATE OR REPLACE TABLE {safe_staging} AS
+                                    SELECT * FROM read_csv('{_sql_literal(path)}',
+                                        delim='{delim}',
+                                        header={'TRUE' if hdr else 'FALSE'},
+                                        quote='{q}',
+                                        escape='{q}',
+                                        comment='\0',
+                                        encoding='{enc}',
+                                        all_varchar=TRUE,
+                                        ignore_errors=TRUE,
+                                        maximum_line_size='10000000',
+                                        parallel=FALSE,
+                                        new_line='{nl}'
+                                    );
+                                """)
+                                return None
+                            except duckdb.Error as e:
+                                last_err = str(e)
+                                # continue trying variants
+                    # b) quoting fully disabled (treat quotes as plain text)
+                    for hdr in header_opts:
+                        try:
+                            con.execute(f"""
+                                CREATE OR REPLACE TABLE {safe_staging} AS
+                                SELECT * FROM read_csv('{_sql_literal(path)}',
+                                    delim='{delim}',
+                                    header={'TRUE' if hdr else 'FALSE'},
+                                    quote='\0',
+                                    escape='\0',
+                                    comment='\0',
+                                    encoding='{enc}',
+                                    all_varchar=TRUE,
+                                    ignore_errors=TRUE,
+                                    maximum_line_size='10000000',
+                                    parallel=FALSE,
+                                    new_line='{nl}'
+                                );
+                            """)
+                            return None
+                        except duckdb.Error as e:
+                            last_err = str(e)
+                            continue
+        return last_err
+
+    # ---- Attempt set #1: original file
+    err = _try_read_csv_auto(file_path)
+    if err is None:
+        return
+    err = _try_matrix(file_path)
+    if err is None:
+        return
+
+    # ---- Attempt set #2: pre-cleaned file then try again
+    cleaned = _preclean_csv_to_temp(file_path)
+
+    err2 = _try_read_csv_auto(cleaned)
+    if err2 is None:
+        return
+    err2 = _try_matrix(cleaned)
+    if err2 is None:
+        return
+
+    raise RuntimeError(
+        "CSV import failed after fallbacks. "
+        f"Last errors: original={err!r} cleaned={err2!r}"
+    )
+
+
+
 # ---------- Delete APIs: models ----------
 class BulkDeleteRequest(BaseModel):
     # Delete by a set of row hashes (recommended when deleting selected rows from the grid)
@@ -447,7 +641,7 @@ def _guess_delimiter(sample: str) -> Optional[str]:
 def create_staging_from_csv(con: duckdb.DuckDBPyConnection, safe_staging: str, file_path: str) -> None:
     fp = _sql_literal(file_path)
 
-    # Small peek to bias delimiter guess
+    # Peek & guess delimiter
     try:
         with open(file_path, "rb") as fh:
             head = fh.read(128 * 1024)
@@ -456,7 +650,7 @@ def create_staging_from_csv(con: duckdb.DuckDBPyConnection, safe_staging: str, f
         peek = ""
     guessed_delim = _guess_delimiter(peek)
 
-    # --- 1) Fast path: auto, but VERY tolerant
+    # --- 1) Fast path: very tolerant auto
     try:
         con.execute(f"""
             CREATE OR REPLACE TABLE {safe_staging} AS
@@ -465,9 +659,8 @@ def create_staging_from_csv(con: duckdb.DuckDBPyConnection, safe_staging: str, f
                 HEADER=TRUE,
                 NORMALIZE_NAMES=FALSE,
                 ALL_VARCHAR=TRUE,
-                ALLOW_QUOTED_NEWLINES=TRUE,
                 IGNORE_ERRORS=TRUE,
-                MAX_LINE_SIZE=10000000,
+                maximum_line_size='10000000',
                 PARALLEL=FALSE
             );
         """)
@@ -480,7 +673,7 @@ def create_staging_from_csv(con: duckdb.DuckDBPyConnection, safe_staging: str, f
     encodings = ["utf-8", "utf-8-sig", "utf-16", "windows-1252", "iso-8859-1"]
     quotes = ['"', "'"]
     header_opts = [True, False]
-    newlines = ["\n", "\r\n"]
+    newlines = ["auto", "LF", "CRLF"]
 
     for enc in encodings:
         for delim in delims:
@@ -499,9 +692,8 @@ def create_staging_from_csv(con: duckdb.DuckDBPyConnection, safe_staging: str, f
                                     comment='',
                                     encoding='{enc}',
                                     all_varchar=TRUE,
-                                    allow_quoted_newlines=TRUE,
                                     ignore_errors=TRUE,
-                                    max_line_size=10000000,
+                                    maximum_line_size='10000000',
                                     parallel=FALSE,
                                     new_line='{nl}'
                                 );
@@ -523,9 +715,8 @@ def create_staging_from_csv(con: duckdb.DuckDBPyConnection, safe_staging: str, f
                                 comment='',
                                 encoding='{enc}',
                                 all_varchar=TRUE,
-                                allow_quoted_newlines=TRUE,
                                 ignore_errors=TRUE,
-                                max_line_size=10000000,
+                                maximum_line_size='10000000',
                                 parallel=FALSE,
                                 new_line='{nl}'
                             );
@@ -536,7 +727,6 @@ def create_staging_from_csv(con: duckdb.DuckDBPyConnection, safe_staging: str, f
                         continue
 
     raise RuntimeError(f"CSV import failed after fallbacks. Last error: {last_err}")
-
 
 
 # -----------------------------------------------------------------------------
@@ -561,7 +751,7 @@ def process_file(job_id: str, file_path: str, file_hash: str, orig_filename: str
                 return
 
             ext = Path(file_path).suffix.lower()
-            if ext == ".csv":
+            if ext in (".csv", ".tsv", ".txt"):
                 status_set(job_id, stage="parsing_csv")
                 create_staging_from_csv(con, safe_staging, str(file_path))
             elif ext == ".parquet":
@@ -576,13 +766,13 @@ def process_file(job_id: str, file_path: str, file_hash: str, orig_filename: str
                 con.execute(f"""
                     CREATE OR REPLACE TABLE {safe_staging} AS
                     SELECT * FROM read_excel('{_sql_literal(file_path)}',
-                        sheet=NULL,         -- auto-pick first; customize if needed
+                        sheet=NULL,
                         header=TRUE,
                         all_varchar=TRUE
                     );
                 """)
             else:
-                raise ValueError("Unsupported file type (csv or parquet only)")
+                raise ValueError("Unsupported file type (csv/tsv/txt, parquet, or excel)")
 
             # normalize columns (rename raw headers → cleaned names)
             status_set(job_id, stage="schema_evolved")
