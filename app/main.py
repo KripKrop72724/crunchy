@@ -25,6 +25,7 @@ from fastapi import (
     Request,
     UploadFile,
     WebSocket,
+    Response
 )
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -51,6 +52,7 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["*"],
 )
 redis_client = redis.Redis.from_url(REDIS_URL, decode_responses=True)
 queue = Queue(connection=redis_client)
@@ -814,22 +816,29 @@ async def status_stream(job_id: str, _: None = Depends(verify_api_key)):
 # Columns & distinct values (for dropdowns)
 # -----------------------------------------------------------------------------
 @app.get("/columns")
-def columns(_: None = Depends(verify_api_key)):
+def columns(response: Response, _: None = Depends(verify_api_key)):
     with duckdb.connect(DB_PATH, read_only=True) as con:
-        cols = list_user_columns(con)
+        total = con.execute("SELECT COUNT(*) FROM dataset").fetchone()[0]
+        cols = [] if total == 0 else list_user_columns(con)
+
+    # anti-cache + version
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Expires"] = "0"
+    response.headers["X-Dataset-Version"] = str(_get_dataset_version())
     return {"columns": cols}
 
 
 @app.get("/distinct/{column}")
-def distinct_values(
-        column: str,
-        q: Optional[str] = None,
-        limit: conint(gt=0) = 200,
-        _: None = Depends(verify_api_key),
+def distinct_values(response: Response,
+    column: str,
+    q: Optional[str] = None,
+    limit: conint(gt=0) = 200,
+    _: None = Depends(verify_api_key),
 ):
     if column in INTERNAL_COLS:
         raise HTTPException(400, "Invalid column")
-    col = quote_ident(column)  # strict: expect cleaned names on the API
+    col = quote_ident(column)
     params: List[Any] = []
     where_sql = f"WHERE {col} IS NOT NULL"
     if q:
@@ -840,7 +849,14 @@ def distinct_values(
             f"SELECT DISTINCT {col} AS v FROM dataset {where_sql} ORDER BY v LIMIT ?",
             (*params, limit),
         ).fetchall()
+
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Expires"] = "0"
+    response.headers["X-Dataset-Version"] = str(_get_dataset_version())
     return {"values": [r[0] for r in rows]}
+
+
 
 
 # -----------------------------------------------------------------------------
@@ -1084,7 +1100,7 @@ def bulk_delete(body: BulkDeleteRequest, _: None = Depends(verify_api_key)):
             if deleted > 0:
                 _bump_dataset_version()
 
-            con.execute("COMMIT;")
+            # con.execute("COMMIT;")
         except Exception:
             con.execute("ROLLBACK;")
             raise
@@ -1122,7 +1138,10 @@ def admin_clear(body: ClearRequest, _: None = Depends(verify_api_key)):
             con.execute("BEGIN TRANSACTION;")
             try:
                 con.execute("DELETE FROM dataset;")
-                # optional: keep files? when 'all', also clear files
+                # inside admin_clear, after DELETE FROM dataset; and before COMMIT
+                user_cols = [c for c in list_user_columns(con)]
+                for c in user_cols:
+                    con.execute(f'ALTER TABLE dataset DROP COLUMN {quote_ident(c)};')
                 if scope == "all":
                     con.execute("DELETE FROM files;")
                 # tidy DB
