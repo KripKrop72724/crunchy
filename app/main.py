@@ -5,9 +5,11 @@ import asyncio
 import json
 import hashlib
 import re
-from typing import Any, Dict, List, Optional
+import logging
+from typing import Any, Dict, List, Optional, Tuple
 from datetime import date, datetime
-
+import os
+from itertools import islice
 import aiofiles
 import duckdb
 import redis
@@ -29,6 +31,15 @@ from fastapi.middleware.cors import CORSMiddleware
 
 # ---- project config (ENV → objects) -----------------------------------------
 from .config import API_KEY, DB_PATH, REDIS_URL, UPLOAD_DIR
+
+# -----------------------------------------------------------------------------
+# Logging (minimal but useful)
+# -----------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+)
+log = logging.getLogger("crunchy")
 
 # -----------------------------------------------------------------------------
 # App & infra
@@ -55,43 +66,69 @@ BATCH_SIZE = 100_000
 IDENT_REGEX = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 INTERNAL_COLS = {"row_hash", "__source_file", "__ingested_at"}
 
+# cache/keying helper: bump whenever dataset/files change
+DATASET_VERSION_KEY = "dataset:version"
+
+def _get_dataset_version() -> int:
+    try:
+        return int(redis_client.get(DATASET_VERSION_KEY) or 0)
+    except RedisError:
+        return 0
+
+def _bump_dataset_version() -> None:
+    try:
+        redis_client.incr(DATASET_VERSION_KEY)
+    except RedisError as e:
+        log.warning("Failed to bump dataset version: %s", e)
+
+
 def quote_ident(name: str) -> str:
     """Strict: validate and quote a *cleaned/trusted* SQL identifier."""
     if not IDENT_REGEX.match(name):
         raise HTTPException(400, f"Invalid identifier: {name!r}")
     return f'"{name}"'
 
+
+def _nonempty_predicate(cols: List[str], alias: str = "s") -> str:
+    """
+    Return a SQL boolean expression that is TRUE when at least one of the given
+    columns (present in the current staging) is non-empty after TRIM.
+    Uses only provided `cols` (e.g., the columns present in the new file).
+    """
+    if not cols:
+        # If we somehow have no columns, treat all rows as empty ⇒ filter out everything.
+        return "FALSE"
+    pieces = []
+    for c in cols:
+        # TRIM(CAST(s."col" AS VARCHAR)) <> ''
+        pieces.append(f"(TRIM(CAST({alias}.{quote_ident(c)} AS VARCHAR)) <> '')")
+    return " OR ".join(pieces)
+
+
 def quote_any_ident(name: str) -> str:
     """Loose: safely quote *any* identifier (raw CSV header, may have spaces, symbols)."""
     return '"' + str(name).replace('"', '""') + '"'
 
-def record_file(con: duckdb.DuckDBPyConnection, job_id: str, filename: str, file_hash: str) -> None:
-    # Insert only if (filename, file_hash) is new. This avoids choosing a conflict target
-    # and works on all DuckDB versions without ON CONFLICT support.
-    con.execute(
-        """
-        INSERT INTO files(file_id, filename, file_hash)
-        SELECT ?, ?, ?
-        WHERE NOT EXISTS (
-            SELECT 1 FROM files WHERE filename = ? AND file_hash = ?
-        );
-        """,
-        (job_id, filename, file_hash, filename, file_hash),
-    )
+
+def _sql_literal(s: str) -> str:
+    # Safely embed a path or text in a SQL string literal
+    return s.replace("'", "''")
 
 
 def clean_col(name: str) -> str:
     # lower → replace spaces/dashes with _ → drop non [A-Za-z0-9_]
-    n = name.strip().lower().replace(" ", "_").replace("-", "_")
+    n = (name or "").strip().lower().replace(" ", "_").replace("-", "_")
     n = re.sub(r"[^a-z0-9_]", "", n)
     if not n or n[0].isdigit():
         n = f"col_{n}" if n else "col"
     return n
 
+
 def _json_default(obj: Any):
     if isinstance(obj, (date, datetime)):
         return obj.isoformat()
     raise TypeError
+
 
 # richer job status helpers
 def status_set(job_id: str, **kw):
@@ -104,23 +141,47 @@ def status_set(job_id: str, **kw):
             mapping[k] = json.dumps(v)
         else:
             mapping[k] = str(v)
-    redis_client.hset(job_key, mapping=mapping)
+    try:
+        redis_client.hset(job_key, mapping=mapping)
+    except RedisError as e:
+        log.warning("Redis hset failed: %s", e)
+
+
+def _maybe_optimize(con: duckdb.DuckDBPyConnection) -> None:
+    """
+    Best-effort storage maintenance across DuckDB versions.
+    Tries VACUUM or PRAGMA checkpoint; ignores if unsupported.
+    """
+    for stmt in ("VACUUM", "PRAGMA checkpoint"):
+        try:
+            con.execute(f"{stmt};")
+            return
+        except duckdb.Error:
+            continue
+
+
 
 def status_get(job_id: str) -> dict:
     job_key = f"job:{job_id}"
-    data = redis_client.hgetall(job_key)
+    try:
+        data = redis_client.hgetall(job_key)
+    except RedisError:
+        data = {}
     if not data:
         return {}
+
     def to_int(x):
         try:
             return int(x)
         except:
             return 0
+
     def to_float(x):
         try:
             return float(x)
         except:
             return 0.0
+
     out = {
         "status": data.get("status"),
         "stage": data.get("stage"),
@@ -138,12 +199,117 @@ def status_get(job_id: str) -> dict:
     }
     return out
 
+
+# ---------- Delete APIs: models ----------
+class BulkDeleteRequest(BaseModel):
+    # Delete by a set of row hashes (recommended when deleting selected rows from the grid)
+    row_hashes: Optional[List[int]] = None
+    # Or delete by filters (same shape as your /query filters)
+    filters: Dict[str, List[str]] = {}
+    # Optionally restrict to specific source file names (matches "__source_file")
+    source_files: Optional[List[str]] = None
+    # Safety controls
+    dry_run: bool = False
+    confirm: bool = False
+    expected_min: Optional[int] = None
+    expected_max: Optional[int] = None
+    # If deleting by source_files, optionally drop their file records so re-uploads are not skipped
+    drop_file_records: bool = False
+
+
+class ClearRequest(BaseModel):
+    # what to clear: "dataset", "files", "uploads", "redis", or "all"
+    scope: str = "all"
+    # safety
+    confirm: bool = False
+    # must equal exactly "DELETE ALL" when scope implies wiping the dataset
+    confirm_token: Optional[str] = None
+
+
+# ---------- Delete APIs: helpers ----------
+def _chunks(seq: List[Any], size: int):
+    it = iter(seq)
+    while True:
+        chunk = list(islice(it, size))
+        if not chunk:
+            return
+        yield chunk
+
+
+def _build_base_where_for_delete(
+        con: duckdb.DuckDBPyConnection,
+        filters: Dict[str, List[str]],
+        source_files: Optional[List[str]]
+) -> Tuple[str, List[Any]]:
+    """
+    Build a WHERE clause & params using user columns + optional __source_file restriction.
+    """
+    user_cols_list = list_user_columns(con)
+    user_cols = set(user_cols_list)
+
+    clauses: List[str] = []
+    params: List[Any] = []
+
+    # user columns (IN-list semantics, AND across columns)
+    for c, vals in filters.items():
+        if c not in user_cols:
+            raise HTTPException(400, f"Unknown column: {c}")
+        if not vals:
+            # empty list means no-op for this column
+            continue
+        placeholders = ", ".join("?" for _ in vals)
+        clauses.append(f'{quote_ident(c)} IN ({placeholders})')
+        params.extend(vals)
+
+    # optional __source_file
+    if source_files:
+        placeholders = ", ".join("?" for _ in source_files)
+        clauses.append('"__source_file" IN (' + placeholders + ')')
+        params.extend(source_files)
+
+    where_sql = "WHERE " + " AND ".join(clauses) if clauses else ""
+    return where_sql, params
+
+
+def _safe_delete_files_on_disk(upload_dir: Path) -> int:
+    deleted = 0
+    try:
+        for entry in os.scandir(upload_dir):
+            try:
+                if entry.is_file():
+                    os.unlink(entry.path)
+                    deleted += 1
+            except Exception as e:
+                log.warning("Failed to delete upload file %s: %s", entry.path, e)
+    except FileNotFoundError:
+        pass
+    return deleted
+
+
+def _clear_redis_job_keys(prefix: str = "job:") -> int:
+    removed = 0
+    try:
+        # SCAN to avoid blocking Redis
+        cur = 0
+        while True:
+            cur, keys = redis_client.scan(cur, match=f"{prefix}*")
+            if keys:
+                redis_client.delete(*keys)
+                removed += len(keys)
+            if cur == 0:
+                break
+    except RedisError as e:
+        log.warning("Redis scan/delete failed: %s", e)
+    return removed
+
+
 # -----------------------------------------------------------------------------
 # Auth
 # -----------------------------------------------------------------------------
 def verify_api_key(x_api_key: str = Header(None)):
     if API_KEY and x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API Key")
+
 
 # -----------------------------------------------------------------------------
 # Startup: ensure dirs & base tables (and migrate row_hash → UBIGINT)
@@ -187,6 +353,7 @@ def startup_event():
         # 3) Ensure unique index is present (idempotent)
         con.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_dataset_rowhash ON dataset(row_hash);")
 
+
 # -----------------------------------------------------------------------------
 # Pydantic models (simple pre-available filters)
 # -----------------------------------------------------------------------------
@@ -196,9 +363,11 @@ class SimpleQueryRequest(BaseModel):
     limit: conint(gt=0) = 100
     offset: conint(ge=0) = 0
 
+
 class DistinctQuery(BaseModel):
     q: Optional[str] = None
     limit: conint(gt=0) = 200
+
 
 # -----------------------------------------------------------------------------
 # Helpers for DB access
@@ -208,12 +377,19 @@ def list_user_columns(con: duckdb.DuckDBPyConnection) -> List[str]:
     cols = [r[1] for r in rows if r[1] not in INTERNAL_COLS]
     return cols
 
+
 def ensure_columns(con: duckdb.DuckDBPyConnection, cols: List[str]) -> None:
-    # Add missing user columns to dataset (all VARCHAR)
+    """Add missing user columns to dataset (all VARCHAR). Safe under concurrency."""
     current = set(list_user_columns(con))
     for c in cols:
-        if c not in current:
+        if c in current:
+            continue
+        try:
             con.execute(f'ALTER TABLE dataset ADD COLUMN {quote_ident(c)} VARCHAR;')
+        except duckdb.Error as e:
+            # If another worker added it concurrently, ignore
+            log.debug("ADD COLUMN race tolerated for %s: %s", c, e)
+
 
 def compute_hash_expression(cols: List[str], prefix: str = "") -> str:
     """Return UBIGINT hash expression over cols (optionally prefixed)."""
@@ -223,6 +399,136 @@ def compute_hash_expression(cols: List[str], prefix: str = "") -> str:
         items = ", ".join(f"coalesce({quote_ident(c)}, '')" for c in cols)
     return f"CAST(hash({items}) AS UBIGINT)"
 
+
+# -----------------------------------------------------------------------------
+# File metadata write
+# -----------------------------------------------------------------------------
+def record_file(con: duckdb.DuckDBPyConnection, job_id: str, filename: str, file_hash: str) -> None:
+    # Insert only if (filename, file_hash) is new. Works without ON CONFLICT support.
+    con.execute(
+        """
+        INSERT INTO files(file_id, filename, file_hash)
+        SELECT ?, ?, ?
+        WHERE NOT EXISTS (
+            SELECT 1 FROM files WHERE filename = ? AND file_hash = ?
+        );
+        """,
+        (job_id, filename, file_hash, filename, file_hash),
+    )
+
+
+# -----------------------------------------------------------------------------
+# Robust CSV ingestion
+# -----------------------------------------------------------------------------
+def _guess_delimiter(sample: str) -> Optional[str]:
+    # Quick heuristic: pick the delimiter with the most consistent count across lines
+    candidates = [",", ";", "|", "\t"]
+    lines = [ln for ln in sample.splitlines() if ln.strip()]
+    lines = lines[:50]
+    if not lines:
+        return None
+    best = None
+    best_score = -1
+    for d in candidates:
+        counts = [ln.count(d) for ln in lines]
+        if max(counts) == 0:
+            continue
+        mean = sum(counts) / len(counts)
+        var = sum((c - mean) ** 2 for c in counts) / len(counts)
+        score = mean - var  # prefer high mean, low variance
+        if score > best_score:
+            best_score = score
+            best = d
+    return best
+
+
+def create_staging_from_csv(con: duckdb.DuckDBPyConnection, safe_staging: str, file_path: str) -> None:
+    """Robust CSV → staging table loader with tolerant fallbacks."""
+    fp = _sql_literal(file_path)
+
+    # Small peek to bias delimiter guess (works even if encoding is weird; we ignore decode errors)
+    try:
+        with open(file_path, "rb") as fh:
+            head = fh.read(128 * 1024)
+        peek = head.decode("utf-8", errors="ignore")
+    except Exception:
+        peek = ""
+    guessed_delim = _guess_delimiter(peek)
+
+    # 1) Fast path: auto-detect but tolerant on large lines & row length issues
+    try:
+        con.execute(f"""
+            CREATE OR REPLACE TABLE {safe_staging} AS
+            SELECT * FROM read_csv_auto('{fp}',
+                SAMPLE_SIZE=-1,
+                HEADER=TRUE,
+                NORMALIZE_NAMES=FALSE,
+                NULL_PADDING=TRUE,
+                IGNORE_ERRORS=TRUE,
+                MAX_LINE_SIZE=10000000
+            );
+        """)
+        return
+    except duckdb.Error as e1:
+        last_err = str(e1)
+
+    # Order our delim attempts (use guess first if we have one)
+    delims = [d for d in [guessed_delim, ",", ";", "|", "\t"] if d]
+
+    encodings = ["utf-8", "utf-8-sig", "utf-16", "windows-1252", "iso-8859-1"]
+    quotes = ['"', "'"]
+    header_opts = [True, False]
+
+    # 2) Fallbacks: explicit encodings + delimiters + quote/escape combos + header modes
+    for enc in encodings:
+        for delim in delims:
+            # a) Normal quoting (escape same as quote)
+            for q in quotes:
+                for hdr in header_opts:
+                    try:
+                        con.execute(f"""
+                            CREATE OR REPLACE TABLE {safe_staging} AS
+                            SELECT * FROM read_csv('{fp}',
+                                delim='{delim}',
+                                header={'TRUE' if hdr else 'FALSE'},
+                                quote='{q}',
+                                escape='{q}',
+                                comment='\0',
+                                encoding='{enc}',
+                                null_padding=TRUE,
+                                ignore_errors=TRUE,
+                                max_line_size=10000000
+                            );
+                        """)
+                        return
+                    except duckdb.Error as e2:
+                        last_err = str(e2)
+                        continue
+            # b) Disable quoting entirely (many "CSV" exports are broken this way)
+            for hdr in header_opts:
+                try:
+                    con.execute(f"""
+                        CREATE OR REPLACE TABLE {safe_staging} AS
+                        SELECT * FROM read_csv('{fp}',
+                            delim='{delim}',
+                            header={'TRUE' if hdr else 'FALSE'},
+                            quote='\0',
+                            escape='\0',
+                            comment='\0',
+                            encoding='{enc}',
+                            null_padding=TRUE,
+                            ignore_errors=TRUE,
+                            max_line_size=10000000
+                        );
+                    """)
+                    return
+                except duckdb.Error as e3:
+                    last_err = str(e3)
+                    continue
+
+    raise RuntimeError(f"CSV import failed after fallbacks. Last error: {last_err}")
+
+
 # -----------------------------------------------------------------------------
 # Background ingestion job (batched + progress)
 # -----------------------------------------------------------------------------
@@ -230,10 +536,10 @@ def process_file(job_id: str, file_path: str, file_hash: str, orig_filename: str
     rkey = f"job:{job_id}"
     status_set(job_id, status="processing", stage="reading", progress=0.0)
 
-    try:
-        staging = f"staging_{job_id.replace('-', '_')}"
-        safe_staging = quote_ident(staging)
+    staging = f"staging_{job_id.replace('-', '_')}"
+    safe_staging = quote_ident(staging)
 
+    try:
         with duckdb.connect(DB_PATH, read_only=False) as con:
             # double-check file-level dedup
             exists = con.execute(
@@ -246,14 +552,12 @@ def process_file(job_id: str, file_path: str, file_hash: str, orig_filename: str
 
             ext = Path(file_path).suffix.lower()
             if ext == ".csv":
-                con.execute(f"""
-                    CREATE OR REPLACE TABLE {safe_staging} AS
-                    SELECT * FROM read_csv_auto('{file_path}', SAMPLE_SIZE=-1, HEADER=TRUE, normalize_names=FALSE);
-                """)
+                status_set(job_id, stage="parsing_csv")
+                create_staging_from_csv(con, safe_staging, str(file_path))
             elif ext == ".parquet":
                 con.execute(f"""
                     CREATE OR REPLACE TABLE {safe_staging} AS
-                    SELECT * FROM parquet_scan('{file_path}');
+                    SELECT * FROM parquet_scan('{_sql_literal(file_path)}');
                 """)
             else:
                 raise ValueError("Unsupported file type (csv or parquet only)")
@@ -291,16 +595,17 @@ def process_file(job_id: str, file_path: str, file_hash: str, orig_filename: str
             # count rows to drive progress
             status_set(job_id, stage="counting")
             rows_total = con.execute(f"SELECT COUNT(*) FROM {safe_staging}").fetchone()[0]
-            redis_client.hset(rkey, "rows_total", rows_total)
+            status_set(job_id, rows_total=rows_total)
 
             if rows_total == 0:
                 record_file(con, job_id, orig_filename, file_hash)
-                status_set(job_id, status="completed", stage="completed", progress=1.0, ended_at=datetime.utcnow().isoformat())
-                con.execute(f"DROP TABLE IF EXISTS {safe_staging}")
+                status_set(job_id, status="completed", stage="completed", progress=1.0,
+                           ended_at=datetime.utcnow().isoformat())
                 return
 
             # add a stable row_number for batching
-            con.execute(f'CREATE TEMP TABLE {staging}_rn AS SELECT *, row_number() OVER () AS __rn FROM {safe_staging};')
+            con.execute(
+                f'CREATE TEMP TABLE {staging}_rn AS SELECT *, row_number() OVER () AS __rn FROM {safe_staging};')
 
             # build per-column expressions for projection and hashing w/ alias s
             proj_parts = []
@@ -313,12 +618,10 @@ def process_file(job_id: str, file_path: str, file_hash: str, orig_filename: str
                     proj_parts.append(f'CAST(NULL AS VARCHAR) AS {quote_ident(c)}')
                     hash_parts.append("''")
             projection = ", ".join(proj_parts)
-            # >>> ensure UBIGINT hash to match column type
             row_hash_expr = f"CAST(hash({', '.join(hash_parts)}) AS UBIGINT)"
 
             rows_processed = 0
             rows_inserted = 0
-            rows_skipped = 0
 
             status_set(job_id, stage="ingesting", rows_processed=0, rows_inserted=0, rows_skipped=0)
             while rows_processed < rows_total:
@@ -331,19 +634,42 @@ def process_file(job_id: str, file_path: str, file_hash: str, orig_filename: str
                 target_cols_csv = f"{user_cols_csv}, row_hash, __source_file, __ingested_at"
 
                 # Insert unique rows for this batch using anti-join on row_hash
-                con.execute(f"""
-                    INSERT INTO dataset ({target_cols_csv})
-                    SELECT {projection},
-                           {row_hash_expr} AS row_hash,
-                           ? AS __source_file,
-                           NOW() AS __ingested_at
+                # Build a predicate to drop fully-empty rows (based on columns actually present in this file)
+                nonempty = _nonempty_predicate(new_cols, alias="s")
+
+                # Insert unique rows for this batch:
+                #  - drop fully-empty rows
+                #  - de-duplicate inside the batch on row_hash (keep first per hash)
+                #  - still anti-join against dataset
+                sql = f"""
+                WITH src AS (
+                    SELECT
+                        {projection},
+                        {row_hash_expr} AS row_hash,
+                        s.__rn
                     FROM {staging}_rn s
                     WHERE s.__rn BETWEEN ? AND ?
-                      AND NOT EXISTS (
-                          SELECT 1 FROM dataset d WHERE d.row_hash = {row_hash_expr}
-                      );
-                """, [orig_filename, lo, hi])
+                      AND ({nonempty})
+                ),
+                dedup AS (
+                    SELECT
+                        *,
+                        ROW_NUMBER() OVER (PARTITION BY row_hash ORDER BY __rn) AS _dup
+                    FROM src
+                )
+                INSERT INTO dataset ({target_cols_csv})
+                SELECT
+                    {", ".join(quote_ident(c) for c in all_user_cols)},
+                    row_hash,
+                    ? AS __source_file,
+                    NOW() AS __ingested_at
+                FROM dedup
+                WHERE _dup = 1
+                  AND NOT EXISTS (SELECT 1 FROM dataset d WHERE d.row_hash = dedup.row_hash);
+                """
 
+                # NOTE: parameter order matches the CTE: lo, hi, then filename for __source_file
+                con.execute(sql, [lo, hi, orig_filename])
                 after_cnt = con.execute("SELECT COUNT(*) FROM dataset").fetchone()[0]
                 inserted = max(0, after_cnt - before_cnt)
 
@@ -362,22 +688,30 @@ def process_file(job_id: str, file_path: str, file_hash: str, orig_filename: str
 
             # record file & cleanup
             record_file(con, job_id, orig_filename, file_hash)
-            con.execute(f"DROP TABLE IF EXISTS {safe_staging}")
-            con.execute(f"DROP TABLE IF EXISTS {staging}_rn")
-
-            status_set(job_id, status="completed", stage="completed", progress=1.0, ended_at=datetime.utcnow().isoformat())
+            status_set(job_id, status="completed", stage="completed", progress=1.0,
+                       ended_at=datetime.utcnow().isoformat())
 
     except Exception as e:
+        log.exception("Ingestion failed for job %s", job_id)
         status_set(job_id, status="failed", stage="failed", error=str(e), ended_at=datetime.utcnow().isoformat())
+    finally:
+        # Always attempt to clean up staging temps, even on failure
+        try:
+            with duckdb.connect(DB_PATH, read_only=False) as con2:
+                con2.execute(f"DROP TABLE IF EXISTS {safe_staging}")
+                con2.execute(f"DROP TABLE IF EXISTS {staging}_rn")
+        except Exception:
+            pass
+
 
 # -----------------------------------------------------------------------------
 # Upload / Status
 # -----------------------------------------------------------------------------
 @app.post("/upload")
 async def upload(
-    request: Request,
-    file: UploadFile = File(...),
-    _: None = Depends(verify_api_key),
+        request: Request,
+        file: UploadFile = File(...),
+        _: None = Depends(verify_api_key),
 ):
     job_id = str(uuid.uuid4())
     dest_path = UPLOAD_DIR / f"{job_id}_{file.filename}"
@@ -406,16 +740,23 @@ async def upload(
     hasher = hashlib.sha256()
     try:
         async with aiofiles.open(dest_path, "wb") as out:
-            while chunk := await file.read(1024 * 1024):
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
                 hasher.update(chunk)
                 await out.write(chunk)
-                redis_client.hincrby(f"job:{job_id}", "uploaded", len(chunk))
-                if total:
-                    uploaded = int(redis_client.hget(f"job:{job_id}", "uploaded") or 0)
-                    prog = min(1.0, uploaded / total)
-                    status_set(job_id, progress=prog)
+                try:
+                    redis_client.hincrby(f"job:{job_id}", "uploaded", len(chunk))
+                    if total:
+                        uploaded = int(redis_client.hget(f"job:{job_id}", "uploaded") or 0)
+                        prog = min(1.0, uploaded / total)
+                        status_set(job_id, progress=prog)
+                except RedisError:
+                    pass
     except Exception as e:
-        status_set(job_id, status="failed", stage="uploading", error=f"Upload error: {e}", ended_at=datetime.utcnow().isoformat())
+        status_set(job_id, status="failed", stage="uploading", error=f"Upload error: {e}",
+                   ended_at=datetime.utcnow().isoformat())
         raise HTTPException(500, "Failed to upload file.")
 
     file_hash = hasher.hexdigest()
@@ -435,6 +776,7 @@ async def upload(
     queue.enqueue(process_file, job_id, str(dest_path), file_hash, file.filename)
     return {"job_id": job_id}
 
+
 @app.get("/status/{job_id}")
 def status(job_id: str, _: None = Depends(verify_api_key)):
     data = status_get(job_id)
@@ -442,24 +784,30 @@ def status(job_id: str, _: None = Depends(verify_api_key)):
         raise HTTPException(404, "Unknown job_id")
     return JSONResponse(data)
 
+
 # Optional SSE stream of status (handy if you don't want websockets)
 @app.get("/status/stream/{job_id}")
 async def status_stream(job_id: str, _: None = Depends(verify_api_key)):
     async def gen():
         prev = None
-        while True:
-            data = status_get(job_id)
-            if not data.get("status"):
-                yield "event: error\ndata: {\"error\":\"unknown job\"}\n\n"
-                break
-            if data != prev:
-                payload = json.dumps(data)
-                yield f"data: {payload}\n\n"
-                prev = dict(data)
-                if data.get("status") in {"completed", "failed"}:
+        try:
+            while True:
+                data = status_get(job_id)
+                if not data.get("status"):
+                    yield "event: error\ndata: {\"error\":\"unknown job\"}\n\n"
                     break
-            await asyncio.sleep(1)
+                if data != prev:
+                    payload = json.dumps(data)
+                    yield f"data: {payload}\n\n"
+                    prev = dict(data)
+                    if data.get("status") in {"completed", "failed"}:
+                        break
+                await asyncio.sleep(1)
+        except asyncio.CancelledError:
+            return
+
     return StreamingResponse(gen(), media_type="text/event-stream")
+
 
 # -----------------------------------------------------------------------------
 # Columns & distinct values (for dropdowns)
@@ -470,12 +818,13 @@ def columns(_: None = Depends(verify_api_key)):
         cols = list_user_columns(con)
     return {"columns": cols}
 
+
 @app.get("/distinct/{column}")
 def distinct_values(
-    column: str,
-    q: Optional[str] = None,
-    limit: conint(gt=0) = 200,
-    _: None = Depends(verify_api_key),
+        column: str,
+        q: Optional[str] = None,
+        limit: conint(gt=0) = 200,
+        _: None = Depends(verify_api_key),
 ):
     if column in INTERNAL_COLS:
         raise HTTPException(400, "Invalid column")
@@ -492,6 +841,7 @@ def distinct_values(
         ).fetchall()
     return {"values": [r[0] for r in rows]}
 
+
 # -----------------------------------------------------------------------------
 # Simple AND filters query
 # -----------------------------------------------------------------------------
@@ -500,6 +850,7 @@ class SimpleQueryRequest(BaseModel):
     fields: Optional[List[str]] = None
     limit: conint(gt=0) = 100
     offset: conint(ge=0) = 0
+
 
 @app.post("/query")
 def simple_query(body: SimpleQueryRequest, _: None = Depends(verify_api_key)):
@@ -538,7 +889,6 @@ def simple_query(body: SimpleQueryRequest, _: None = Depends(verify_api_key)):
         else:
             fields = sorted(user_cols_list)
 
-        # Defensive: if fields resolved to empty (shouldn't happen), return empty result
         if not fields:
             result = {"rows": [], "total": 0}
             try:
@@ -585,6 +935,7 @@ def simple_query(body: SimpleQueryRequest, _: None = Depends(verify_api_key)):
         pass
     return result
 
+
 # -----------------------------------------------------------------------------
 # Streaming (optional)
 # -----------------------------------------------------------------------------
@@ -598,12 +949,12 @@ def stream_query(body: SimpleQueryRequest, _: None = Depends(verify_api_key)):
         user_cols_list = list_user_columns(con)
         user_cols = set(user_cols_list)
 
-        # No user columns → return an empty stream immediately
         if not user_cols_list:
             def empty():
                 if False:
                     yield ""
                 return
+
             return StreamingResponse(empty(), media_type="application/x-ndjson")
 
         if body.fields:
@@ -619,6 +970,7 @@ def stream_query(body: SimpleQueryRequest, _: None = Depends(verify_api_key)):
                 if False:
                     yield ""
                 return
+
             return StreamingResponse(empty(), media_type="application/x-ndjson")
 
         select_cols = ", ".join(quote_ident(c) for c in fields)
@@ -652,6 +1004,146 @@ def stream_query(body: SimpleQueryRequest, _: None = Depends(verify_api_key)):
 
     return StreamingResponse(gen(), media_type="application/x-ndjson")
 
+
+# -----------------------------------------------------------------------------
+# Bulk delete (safe, chunked, dry-run)
+# -----------------------------------------------------------------------------
+@app.post("/delete")
+def bulk_delete(body: BulkDeleteRequest, _: None = Depends(verify_api_key)):
+    if not body.row_hashes and not body.filters and not body.source_files:
+        # avoid accidental full-table deletes; use /admin/clear for wipes
+        raise HTTPException(400, "No delete criteria supplied (row_hashes | filters | source_files).")
+
+    # Normalize an empty list to None so we don't build 'IN ()'
+    row_hashes = body.row_hashes if body.row_hashes else None
+
+    with duckdb.connect(DB_PATH, read_only=False) as con:
+        # Base WHERE (filters + optional source file restriction)
+        base_where, base_params = _build_base_where_for_delete(con, body.filters, body.source_files)
+
+        # Count matches
+        matched = 0
+        if row_hashes:
+            for chunk in _chunks(row_hashes, 5000):
+                placeholders = ", ".join("?" for _ in chunk)
+                where = base_where + ((" AND " if base_where else "WHERE ") + f"row_hash IN ({placeholders})")
+                matched += con.execute(f"SELECT COUNT(*) FROM dataset {where}", (*base_params, *chunk)).fetchone()[0]
+        else:
+            matched = con.execute(f"SELECT COUNT(*) FROM dataset {base_where}", base_params).fetchone()[0]
+
+        # If dry-run, just report
+        if body.dry_run:
+            return {"matched": matched, "deleted": 0, "dry_run": True}
+
+        # Safety gates
+        if not body.confirm:
+            raise HTTPException(400, "Set confirm=true to perform the delete (use dry_run first).")
+        if body.expected_min is not None and matched < body.expected_min:
+            raise HTTPException(409, f"Matched {matched} rows, below expected_min={body.expected_min}.")
+        if body.expected_max is not None and matched > body.expected_max:
+            raise HTTPException(409, f"Matched {matched} rows, above expected_max={body.expected_max}.")
+
+        # Perform deletes inside a transaction; chunk when using row_hashes
+        deleted = 0
+        con.execute("BEGIN TRANSACTION;")
+        try:
+            if row_hashes:
+                for chunk in _chunks(row_hashes, 5000):
+                    placeholders = ", ".join("?" for _ in chunk)
+                    where = base_where + ((" AND " if base_where else "WHERE ") + f"row_hash IN ({placeholders})")
+                    # Count then delete (DuckDB doesn't expose changes() like SQLite)
+                    n = con.execute(f"SELECT COUNT(*) FROM dataset {where}", (*base_params, *chunk)).fetchone()[0]
+                    con.execute(f"DELETE FROM dataset {where}", (*base_params, *chunk))
+                    deleted += n
+            else:
+                n = con.execute(f"SELECT COUNT(*) FROM dataset {base_where}", base_params).fetchone()[0]
+                con.execute(f"DELETE FROM dataset {base_where}", base_params)
+                deleted += n
+
+            # If we deleted by source_files and user asked to drop file records, remove from files table too
+            dropped_files = 0
+            if body.source_files and body.drop_file_records:
+                placeholders = ", ".join("?" for _ in body.source_files)
+                dropped_files = con.execute(
+                    f"SELECT COUNT(*) FROM files WHERE filename IN ({placeholders})",
+                    body.source_files
+                ).fetchone()[0]
+                con.execute(f"DELETE FROM files WHERE filename IN ({placeholders})", body.source_files)
+
+            # Keep DB tidy after big deletes
+            if deleted >= 100_000:
+                _maybe_optimize(con)
+
+            con.execute("COMMIT;")
+        except Exception:
+            con.execute("ROLLBACK;")
+            raise
+
+    return {"matched": matched, "deleted": deleted}
+
+
+# -----------------------------------------------------------------------------
+# Clear all data (scoped, guarded)
+# -----------------------------------------------------------------------------
+@app.post("/admin/clear")
+def admin_clear(body: ClearRequest, _: None = Depends(verify_api_key)):
+    scope = (body.scope or "all").lower()
+
+    # Determine if the operation wipes dataset
+    wipes_dataset = scope in ("dataset", "all")
+
+    # Strong confirmation for dataset wipes
+    if wipes_dataset:
+        if not body.confirm or body.confirm_token != "DELETE ALL":
+            raise HTTPException(
+                400,
+                'Clearing the dataset requires confirm=true and confirm_token="DELETE ALL".'
+            )
+    else:
+        if not body.confirm:
+            raise HTTPException(400, "Set confirm=true to perform this operation.")
+
+    cleared = []
+
+    # DuckDB objects
+    if scope in ("dataset", "all"):
+        with duckdb.connect(DB_PATH, read_only=False) as con:
+            # Delete all rows but keep schema & index
+            con.execute("BEGIN TRANSACTION;")
+            try:
+                con.execute("DELETE FROM dataset;")
+                # optional: keep files? when 'all', also clear files
+                if scope == "all":
+                    con.execute("DELETE FROM files;")
+                # tidy DB
+                _maybe_optimize(con)
+                con.execute("COMMIT;")
+                cleared.append("dataset")
+                if scope == "all":
+                    cleared.append("files")
+            except Exception:
+                con.execute("ROLLBACK;")
+                raise
+
+    elif scope == "files":
+        with duckdb.connect(DB_PATH, read_only=False) as con:
+            con.execute("DELETE FROM files;")
+            _maybe_optimize(con)
+            cleared.append("files")
+
+    # Uploads on disk
+    if scope in ("uploads", "all"):
+        cnt = _safe_delete_files_on_disk(UPLOAD_DIR)
+        cleared.append(f"uploads:{cnt}")
+
+    # Redis job state
+    if scope in ("redis", "all"):
+        removed = _clear_redis_job_keys(prefix="job:")
+        cleared.append(f"redis:{removed}")
+
+    return {"ok": True, "cleared": cleared}
+
+
 # -----------------------------------------------------------------------------
 # Live job status (WebSocket)
 # -----------------------------------------------------------------------------
@@ -673,6 +1165,7 @@ async def ws_status(websocket: WebSocket, job_id: str):
             await asyncio.sleep(1)
     finally:
         await websocket.close()
+
 
 # -----------------------------------------------------------------------------
 # Health
