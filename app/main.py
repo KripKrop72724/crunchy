@@ -482,6 +482,23 @@ class DistinctQuery(BaseModel):
     limit: conint(gt=0) = 200
 
 
+class FacetRequest(BaseModel):
+    # current selections in the UI (same shape as /query)
+    filters: Dict[str, List[str]] = {}
+    # which columns to facet; None = all user columns
+    fields: Optional[List[str]] = None
+    # how many values per facet to return
+    limit: conint(gt=0) = 100
+    # typical facet behavior: when computing counts for column X,
+    # ignore X’s own filter so the UI can show all options for X
+    exclude_self: bool = True
+    # include NULL/empty-string as values? (default false)
+    include_empty: bool = False
+    # ordering for each facet’s values
+    #   "count_desc" (default), "value_asc", "value_desc"
+    order: Optional[str] = "count_desc"
+
+
 class BulkDeleteRequest(BaseModel):
     row_hashes: Optional[List[int]] = None
     filters: Dict[str, List[str]] = {}
@@ -853,6 +870,118 @@ def distinct_values(response: Response,
     response.headers["Expires"] = "0"
     response.headers["X-Dataset-Version"] = str(_get_dataset_version())
     return {"values": [r[0] for r in rows]}
+
+
+@app.post("/facets")
+def facet_counts(body: FacetRequest, _: None = Depends(verify_api_key)):
+    """
+    Return counts per value for each requested column (facets).
+    Honors current filters; by default uses 'exclude_self' semantics so that
+    when computing counts for column C, the filter on C is ignored.
+    """
+    # cache key tied to dataset version + request body
+    version = _get_dataset_version()
+    raw_key = f"facets|v={version}|{json.dumps(body.dict(), sort_keys=True)}"
+    cache_key = hashlib.sha256(raw_key.encode()).hexdigest()
+
+    # try cache
+    try:
+        cached = redis_client.get(cache_key)
+    except RedisError:
+        cached = None
+    if cached:
+        return json.loads(cached)
+
+    with db_open(read_only=True) as con:
+        user_cols_list = list_user_columns(con)
+        user_cols = set(user_cols_list)
+
+        # no user columns → empty result
+        if not user_cols_list:
+            result = {"facets": {}, "total": 0, "columns": []}
+            try:
+                redis_client.setex(cache_key, QUERY_CACHE_TTL, json.dumps(result))
+            except RedisError:
+                pass
+            return result
+
+        # validate requested fields or default to "all user columns"
+        if body.fields:
+            fields = []
+            for c in body.fields:
+                if c not in user_cols:
+                    raise HTTPException(400, f"Unknown column: {c}")
+                fields.append(c)
+        else:
+            fields = sorted(user_cols_list)
+
+        # helper to build WHERE/params, optionally excluding a column’s own filter
+        def _build_where(exclude_col: Optional[str]) -> Tuple[str, List[Any]]:
+            clauses: List[str] = []
+            params: List[Any] = []
+            for c, vals in body.filters.items():
+                if c not in user_cols:
+                    raise HTTPException(400, f"Unknown column in filters: {c}")
+                if body.exclude_self and exclude_col and c == exclude_col:
+                    # skip this column’s own filter during its facet computation
+                    continue
+                if not vals:
+                    continue
+                placeholders = ", ".join("?" for _ in vals)
+                clauses.append(f'{quote_ident(c)} IN ({placeholders})')
+                params.extend(vals)
+            where_sql = "WHERE " + " AND ".join(clauses) if clauses else ""
+            return where_sql, params
+
+        # base total for the current filter state (includes all filters)
+        where_all, params_all = _build_where(exclude_col=None)
+        total_sql = f"SELECT COUNT(*) FROM dataset {where_all};"
+        total_rows = con.execute(total_sql, params_all).fetchone()[0]
+
+        # choose ordering
+        if body.order == "value_asc":
+            order_sql = "v ASC"
+        elif body.order == "value_desc":
+            order_sql = "v DESC"
+        else:
+            order_sql = "n DESC, v ASC"  # default
+
+        out: Dict[str, List[Dict[str, Any]]] = {}
+
+        for col in fields:
+            where_sql, params = _build_where(exclude_col=col)
+
+            # additional constraints for the facet column itself
+            extra_clauses: List[str] = []
+            if not body.include_empty:
+                qcol = quote_ident(col)
+                extra_clauses.append(f"{qcol} IS NOT NULL")
+                extra_clauses.append(f"TRIM(CAST({qcol} AS VARCHAR)) <> ''")
+
+            where2 = where_sql
+            if extra_clauses:
+                where2 = where_sql + ((" AND " if where_sql else "WHERE ") + " AND ".join(extra_clauses))
+
+            q = f"""
+                SELECT CAST({quote_ident(col)} AS VARCHAR) AS v, COUNT(*) AS n
+                  FROM dataset
+                  {where2}
+                 GROUP BY 1
+                 ORDER BY {order_sql}
+                 LIMIT ?;
+            """
+            rows = con.execute(q, (*params, body.limit)).fetchall()
+            out[col] = [{"value": r[0], "count": r[1]} for r in rows]
+
+    result = {"facets": out, "total": total_rows, "columns": fields}
+
+    # cache it
+    try:
+        redis_client.setex(cache_key, QUERY_CACHE_TTL, json.dumps(result))
+    except RedisError:
+        pass
+
+    return result
 
 
 # -----------------------------------------------------------------------------
@@ -1246,6 +1375,7 @@ async def ws_status(websocket: WebSocket, job_id: str):
 @app.on_event("startup")
 def startup_event():
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     with db_open(read_only=False) as con:
         con.execute("""
             CREATE TABLE IF NOT EXISTS dataset (
