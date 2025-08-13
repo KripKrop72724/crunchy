@@ -108,6 +108,22 @@ def _nonempty_predicate(cols: List[str], alias: str = "s") -> str:
     return " OR ".join(pieces)
 
 
+def _ingestion_active() -> bool:
+    try:
+        cur = 0
+        while True:
+            cur, keys = redis_client.scan(cur, match="job:*")
+            for k in keys:
+                st = redis_client.hget(k, "status") or ""
+                if st in ("queued", "processing"):
+                    return True
+            if cur == 0:
+                break
+    except RedisError:
+        pass
+    return False
+
+
 def quote_any_ident(name: str) -> str:
     """Loose: safely quote *any* identifier (raw CSV header, may have spaces/symbols)."""
     return '"' + str(name).replace('"', '""') + '"'
@@ -1100,6 +1116,9 @@ def admin_clear(body: ClearRequest, _: None = Depends(verify_api_key)):
     scope = (body.scope or "all").lower()
     wipes_dataset = scope in ("dataset", "all")
 
+    if wipes_dataset and _ingestion_active():
+        raise HTTPException(409, "Cannot clear while an ingestion job is running. Try again after it finishes.")
+
     if wipes_dataset:
         if not body.confirm or body.confirm_token != "DELETE ALL":
             raise HTTPException(
@@ -1113,36 +1132,58 @@ def admin_clear(body: ClearRequest, _: None = Depends(verify_api_key)):
     cleared = []
 
     if scope in ("dataset", "all"):
-        with db_open(read_only=False) as con:
-            con.execute("BEGIN TRANSACTION;")
-            try:
-                # empty the table first
-                con.execute("DELETE FROM dataset;")
+        MAX_RETRIES = 5
+        for attempt in range(MAX_RETRIES):
+            with db_open(read_only=False) as con:
+                try:
+                    con.execute("BEGIN TRANSACTION;")
 
-                # drop dependent index so DROP COLUMN can proceed
-                con.execute("DROP INDEX IF EXISTS idx_dataset_rowhash;")
+                    # empty table first (cheap if already empty)
+                    con.execute("DELETE FROM dataset;")
 
-                # drop all user columns (keep internal ones)
-                user_cols = [c for c in list_user_columns(con)]
-                for c in user_cols:
-                    con.execute(f'ALTER TABLE dataset DROP COLUMN {quote_ident(c)};')
+                    # drop dependent index so DROP COLUMN can proceed
+                    con.execute("DROP INDEX IF EXISTS idx_dataset_rowhash;")
 
-                if scope == "all":
-                    con.execute("DELETE FROM files;")
+                    # drop all user columns (keep internal ones)
+                    user_cols = [c for c in list_user_columns(con)]
+                    for c in user_cols:
+                        con.execute(f'ALTER TABLE dataset DROP COLUMN {quote_ident(c)};')
 
-                _maybe_optimize(con)
+                    if scope == "all":
+                        con.execute("DELETE FROM files;")
 
-                # recreate the index on row_hash
-                con.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_dataset_rowhash ON dataset(row_hash);")
+                    _maybe_optimize(con)
 
-                con.execute("COMMIT;")
-                cleared.append("dataset")
-                if scope == "all":
-                    cleared.append("files")
-                _bump_dataset_version()
-            except Exception:
-                con.execute("ROLLBACK;")
-                raise
+                    # recreate the index on row_hash
+                    con.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_dataset_rowhash ON dataset(row_hash);")
+
+                    con.execute("COMMIT;")
+
+                    cleared.append("dataset")
+                    if scope == "all":
+                        cleared.append("files")
+                    _bump_dataset_version()
+                    break  # success
+
+                except duckdb.TransactionException as e:
+                    # Best-effort rollback; ignore if the txn is already closed
+                    try:
+                        con.execute("ROLLBACK;")
+                    except duckdb.TransactionException:
+                        pass
+
+                    msg = str(e)
+                    # Write/write conflict → backoff & retry
+                    if "another transaction has altered this table" in msg:
+                        time.sleep(0.1 * (attempt + 1))
+                        if attempt == MAX_RETRIES - 1:
+                            raise HTTPException(
+                                409,
+                                "Dataset is being modified by another process. Try again shortly."
+                            )
+                        continue
+                    # Other transaction error → bubble up
+                    raise
 
     elif scope == "files":
         with db_open(read_only=False) as con:
