@@ -445,10 +445,9 @@ def _guess_delimiter(sample: str) -> Optional[str]:
 
 
 def create_staging_from_csv(con: duckdb.DuckDBPyConnection, safe_staging: str, file_path: str) -> None:
-    """Robust CSV → staging table loader with tolerant fallbacks."""
     fp = _sql_literal(file_path)
 
-    # Small peek to bias delimiter guess (works even if encoding is weird; we ignore decode errors)
+    # Small peek to bias delimiter guess
     try:
         with open(file_path, "rb") as fh:
             head = fh.read(128 * 1024)
@@ -457,7 +456,7 @@ def create_staging_from_csv(con: duckdb.DuckDBPyConnection, safe_staging: str, f
         peek = ""
     guessed_delim = _guess_delimiter(peek)
 
-    # 1) Fast path: auto-detect but tolerant on large lines & row length issues
+    # --- 1) Fast path: auto, but VERY tolerant
     try:
         con.execute(f"""
             CREATE OR REPLACE TABLE {safe_staging} AS
@@ -465,27 +464,53 @@ def create_staging_from_csv(con: duckdb.DuckDBPyConnection, safe_staging: str, f
                 SAMPLE_SIZE=-1,
                 HEADER=TRUE,
                 NORMALIZE_NAMES=FALSE,
-                NULL_PADDING=TRUE,
+                ALL_VARCHAR=TRUE,
+                ALLOW_QUOTED_NEWLINES=TRUE,
                 IGNORE_ERRORS=TRUE,
-                MAX_LINE_SIZE=10000000
+                MAX_LINE_SIZE=10000000,
+                PARALLEL=FALSE
             );
         """)
         return
     except duckdb.Error as e1:
         last_err = str(e1)
 
-    # Order our delim attempts (use guess first if we have one)
+    # --- 2) Manual fallbacks: encodings × delimiters × quote/header/newline combos
     delims = [d for d in [guessed_delim, ",", ";", "|", "\t"] if d]
-
     encodings = ["utf-8", "utf-8-sig", "utf-16", "windows-1252", "iso-8859-1"]
     quotes = ['"', "'"]
     header_opts = [True, False]
+    newlines = ["\n", "\r\n"]
 
-    # 2) Fallbacks: explicit encodings + delimiters + quote/escape combos + header modes
     for enc in encodings:
         for delim in delims:
-            # a) Normal quoting (escape same as quote)
-            for q in quotes:
+            for nl in newlines:
+                # a) Normal quoting
+                for q in quotes:
+                    for hdr in header_opts:
+                        try:
+                            con.execute(f"""
+                                CREATE OR REPLACE TABLE {safe_staging} AS
+                                SELECT * FROM read_csv('{fp}',
+                                    delim='{delim}',
+                                    header={'TRUE' if hdr else 'FALSE'},
+                                    quote='{q}',
+                                    escape='{q}',
+                                    comment='',
+                                    encoding='{enc}',
+                                    all_varchar=TRUE,
+                                    allow_quoted_newlines=TRUE,
+                                    ignore_errors=TRUE,
+                                    max_line_size=10000000,
+                                    parallel=FALSE,
+                                    new_line='{nl}'
+                                );
+                            """)
+                            return
+                        except duckdb.Error as e2:
+                            last_err = str(e2)
+                            continue
+                # b) Disable quoting entirely (treat quotes as plain chars)
                 for hdr in header_opts:
                     try:
                         con.execute(f"""
@@ -493,42 +518,25 @@ def create_staging_from_csv(con: duckdb.DuckDBPyConnection, safe_staging: str, f
                             SELECT * FROM read_csv('{fp}',
                                 delim='{delim}',
                                 header={'TRUE' if hdr else 'FALSE'},
-                                quote='{q}',
-                                escape='{q}',
-                                comment='\0',
+                                quote='',
+                                escape='',
+                                comment='',
                                 encoding='{enc}',
-                                null_padding=TRUE,
+                                all_varchar=TRUE,
+                                allow_quoted_newlines=TRUE,
                                 ignore_errors=TRUE,
-                                max_line_size=10000000
+                                max_line_size=10000000,
+                                parallel=FALSE,
+                                new_line='{nl}'
                             );
                         """)
                         return
-                    except duckdb.Error as e2:
-                        last_err = str(e2)
+                    except duckdb.Error as e3:
+                        last_err = str(e3)
                         continue
-            # b) Disable quoting entirely (many "CSV" exports are broken this way)
-            for hdr in header_opts:
-                try:
-                    con.execute(f"""
-                        CREATE OR REPLACE TABLE {safe_staging} AS
-                        SELECT * FROM read_csv('{fp}',
-                            delim='{delim}',
-                            header={'TRUE' if hdr else 'FALSE'},
-                            quote='\0',
-                            escape='\0',
-                            comment='\0',
-                            encoding='{enc}',
-                            null_padding=TRUE,
-                            ignore_errors=TRUE,
-                            max_line_size=10000000
-                        );
-                    """)
-                    return
-                except duckdb.Error as e3:
-                    last_err = str(e3)
-                    continue
 
     raise RuntimeError(f"CSV import failed after fallbacks. Last error: {last_err}")
+
 
 
 # -----------------------------------------------------------------------------
@@ -560,6 +568,18 @@ def process_file(job_id: str, file_path: str, file_hash: str, orig_filename: str
                 con.execute(f"""
                     CREATE OR REPLACE TABLE {safe_staging} AS
                     SELECT * FROM parquet_scan('{_sql_literal(file_path)}');
+                """)
+            elif ext in (".xlsx", ".xlsm", ".xlsb", ".xls"):
+                status_set(job_id, stage="parsing_excel")
+                con.execute("INSTALL excel;")
+                con.execute("LOAD excel;")
+                con.execute(f"""
+                    CREATE OR REPLACE TABLE {safe_staging} AS
+                    SELECT * FROM read_excel('{_sql_literal(file_path)}',
+                        sheet=NULL,         -- auto-pick first; customize if needed
+                        header=TRUE,
+                        all_varchar=TRUE
+                    );
                 """)
             else:
                 raise ValueError("Unsupported file type (csv or parquet only)")
