@@ -690,6 +690,7 @@ def process_file(job_id: str, file_path: str, file_hash: str, orig_filename: str
             record_file(con, job_id, orig_filename, file_hash)
             status_set(job_id, status="completed", stage="completed", progress=1.0,
                        ended_at=datetime.utcnow().isoformat())
+            _bump_dataset_version()
 
     except Exception as e:
         log.exception("Ingestion failed for job %s", job_id)
@@ -859,7 +860,11 @@ def simple_query(body: SimpleQueryRequest, _: None = Depends(verify_api_key)):
         body.fields = None
 
     # cache
-    cache_key = hashlib.sha256(json.dumps(body.dict(), sort_keys=True).encode()).hexdigest()
+    # include dataset version so cache is instantly invalidated on mutations
+    version = _get_dataset_version()
+    raw_key = f"v={version}|{json.dumps(body.dict(), sort_keys=True)}"
+    cache_key = hashlib.sha256(raw_key.encode()).hexdigest()
+
     try:
         cached = redis_client.get(cache_key)
     except RedisError:
@@ -1075,6 +1080,11 @@ def bulk_delete(body: BulkDeleteRequest, _: None = Depends(verify_api_key)):
                 _maybe_optimize(con)
 
             con.execute("COMMIT;")
+            # invalidate caches immediately so UI filters refresh
+            if deleted > 0:
+                _bump_dataset_version()
+
+            con.execute("COMMIT;")
         except Exception:
             con.execute("ROLLBACK;")
             raise
@@ -1121,6 +1131,7 @@ def admin_clear(body: ClearRequest, _: None = Depends(verify_api_key)):
                 cleared.append("dataset")
                 if scope == "all":
                     cleared.append("files")
+                _bump_dataset_version()
             except Exception:
                 con.execute("ROLLBACK;")
                 raise
@@ -1130,6 +1141,7 @@ def admin_clear(body: ClearRequest, _: None = Depends(verify_api_key)):
             con.execute("DELETE FROM files;")
             _maybe_optimize(con)
             cleared.append("files")
+            _bump_dataset_version()
 
     # Uploads on disk
     if scope in ("uploads", "all"):
