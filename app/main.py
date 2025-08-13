@@ -1112,6 +1112,7 @@ def bulk_delete(body: BulkDeleteRequest, _: None = Depends(verify_api_key)):
 # Clear all data (scoped, guarded)
 # -----------------------------------------------------------------------------
 @app.post("/admin/clear")
+
 def admin_clear(body: ClearRequest, _: None = Depends(verify_api_key)):
     scope = (body.scope or "all").lower()
     wipes_dataset = scope in ("dataset", "all")
@@ -1132,65 +1133,56 @@ def admin_clear(body: ClearRequest, _: None = Depends(verify_api_key)):
     cleared = []
 
     if scope in ("dataset", "all"):
-        MAX_RETRIES = 5
-        for attempt in range(MAX_RETRIES):
-            with db_open(read_only=False) as con:
-                try:
-                    con.execute("BEGIN TRANSACTION;")
-
-                    # empty table first (cheap if already empty)
-                    con.execute("DELETE FROM dataset;")
-
-                    # drop dependent index so DROP COLUMN can proceed
-                    con.execute("DROP INDEX IF EXISTS idx_dataset_rowhash;")
-
-                    # drop all user columns (keep internal ones)
-                    user_cols = [c for c in list_user_columns(con)]
-                    for c in user_cols:
-                        con.execute(f'ALTER TABLE dataset DROP COLUMN {quote_ident(c)};')
-
-                    if scope == "all":
-                        con.execute("DELETE FROM files;")
-
-                    _maybe_optimize(con)
-
-                    # recreate the index on row_hash
-                    con.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_dataset_rowhash ON dataset(row_hash);")
-
-                    con.execute("COMMIT;")
-
-                    cleared.append("dataset")
-                    if scope == "all":
-                        cleared.append("files")
-                    _bump_dataset_version()
-                    break  # success
-
-                except duckdb.TransactionException as e:
-                    # Best-effort rollback; ignore if the txn is already closed
-                    try:
-                        con.execute("ROLLBACK;")
-                    except duckdb.TransactionException:
-                        pass
-
-                    msg = str(e)
-                    # Write/write conflict → backoff & retry
-                    if "another transaction has altered this table" in msg:
-                        time.sleep(0.1 * (attempt + 1))
-                        if attempt == MAX_RETRIES - 1:
-                            raise HTTPException(
-                                409,
-                                "Dataset is being modified by another process. Try again shortly."
-                            )
-                        continue
-                    # Other transaction error → bubble up
-                    raise
+        with db_open(read_only=False) as con:
+            con.execute("BEGIN;")
+            con.execute("DROP TABLE IF EXISTS dataset;")
+            con.execute(
+                """
+                CREATE TABLE dataset (
+                    row_hash      UBIGINT,
+                    __source_file VARCHAR,
+                    __ingested_at TIMESTAMP
+                );
+                """
+            )
+            if scope == "all":
+                con.execute("DROP TABLE IF EXISTS files;")
+                con.execute(
+                    """
+                    CREATE TABLE files (
+                        file_id     VARCHAR PRIMARY KEY,
+                        filename    VARCHAR,
+                        file_hash   VARCHAR,
+                        uploaded_at TIMESTAMP DEFAULT NOW(),
+                        UNIQUE(filename, file_hash)
+                    );
+                    """
+                )
+            con.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_dataset_rowhash ON dataset(row_hash);")
+            con.execute("COMMIT;")
+        cleared.append("dataset")
+        if scope == "all":
+            cleared.append("files")
+        _bump_dataset_version()
 
     elif scope == "files":
         with db_open(read_only=False) as con:
-            con.execute("DELETE FROM files;")
-            _maybe_optimize(con)
-            cleared.append("files")
-            _bump_dataset_version()
+            con.execute("BEGIN;")
+            con.execute("DROP TABLE IF EXISTS files;")
+            con.execute(
+                """
+                CREATE TABLE files (
+                    file_id     VARCHAR PRIMARY KEY,
+                    filename    VARCHAR,
+                    file_hash   VARCHAR,
+                    uploaded_at TIMESTAMP DEFAULT NOW(),
+                    UNIQUE(filename, file_hash)
+                );
+                """
+            )
+            con.execute("COMMIT;")
+        cleared.append("files")
+        _bump_dataset_version()
 
     if scope in ("uploads", "all"):
         cnt = 0
@@ -1222,6 +1214,7 @@ def admin_clear(body: ClearRequest, _: None = Depends(verify_api_key)):
         cleared.append(f"redis:{removed}")
 
     return {"ok": True, "cleared": cleared}
+
 
 
 # -----------------------------------------------------------------------------
