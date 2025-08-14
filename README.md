@@ -27,6 +27,8 @@ docker-compose up --build
 ```
 The API will be available at `http://localhost:8000` and the frontend at `http://localhost:5173`.
 
+To serve the API (and optionally the frontend) over HTTP/HTTPS on standard ports, a Caddy reverse proxy container is included. A sample `Caddyfile` is provided that proxies incoming requests on port 80 to the `api` service.
+
 Open the frontend in your browser, supply the API key, select a file, and click **Upload**. When the upload finishes the first few rows are displayed and you can add filters to refine the results via the new query endpoints. Upload progress and row ingestion counts update live using the WebSocket status API.
 
 ## API
